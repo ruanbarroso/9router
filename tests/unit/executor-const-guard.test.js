@@ -39,9 +39,15 @@ describe("provider baseUrl const (full path, no trailing slash)", () => {
   });
 });
 
-describe("antigravity retry (intentional change: 429=6, 503=3)", () => {
-  it("429 attempts = 6", () => {
-    expect(antigravity.transport.retry["429"].attempts).toBe(6);
+describe("antigravity retry (429=3, 503=3)", () => {
+  // Era 6 quando este guard foi escrito. `3f9382de` ("Fix AG, Kiro, Xiaomi
+  // Provider", 2026-06-18) baixou para 3 numa mudança de uma linha, e assim
+  // ficou desde então. Faz sentido com o `computeRetryDelay` da antigravity
+  // (executors/antigravity.js:413): o backoff é `2**attempt` segundos, então
+  // 6 tentativas encostam no teto de Retry-After antes de desistir e seguram
+  // a requisição por mais de um minuto. O guard passa a espelhar o valor real.
+  it("429 attempts = 3", () => {
+    expect(antigravity.transport.retry["429"].attempts).toBe(3);
   });
   it("503 attempts = 3", () => {
     expect(antigravity.transport.retry["503"].attempts).toBe(3);

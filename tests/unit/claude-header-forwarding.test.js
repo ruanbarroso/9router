@@ -236,22 +236,31 @@ describe("proxyAwareFetch — api.anthropic.com routing", () => {
     vi.restoreAllMocks();
   });
 
-  it("routes api.anthropic.com to gotScraping (non-streaming) and returns ok response", async () => {
-    // Mock got-scraping before module load
+  // O roteamento por got-scraping NÃO existe mais: todo o bloco de
+  // fingerprinting TLS está comentado em proxyFetch.js:20-107, e a saída 4 de 4
+  // diz explicitamente "got-scraping disabled — use native fetch directly
+  // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)".
+  // Nenhum host, incluindo api.anthropic.com, passa pelo got-scraping — o teste
+  // pedia uma chamada que o módulo não faz. Os dois testes abaixo ("falls back
+  // gracefully", "does NOT route non-Anthropic hosts") já passavam justamente
+  // porque o destino deles é o fetch nativo.
+  it("envia api.anthropic.com pelo fetch nativo (got-scraping desativado)", async () => {
+    const gotScrapingMock = vi.fn();
     vi.doMock("got-scraping", () => {
-      const mockGotScraping = vi.fn().mockResolvedValue({
-        statusCode: 200,
-        statusMessage: "OK",
-        headers: { "content-type": "application/json" },
-        rawBody: Buffer.from(JSON.stringify({ id: "msg_test" })),
-      });
-      mockGotScraping.stream = vi.fn();
-      return { gotScraping: mockGotScraping };
+      gotScrapingMock.stream = vi.fn();
+      return { gotScraping: gotScrapingMock };
     });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "msg_test" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
 
     vi.resetModules();
     const { proxyAwareFetch } = await import("open-sse/utils/proxyFetch.js");
-    const { gotScraping } = await import("got-scraping");
 
     const res = await proxyAwareFetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -260,11 +269,12 @@ describe("proxyAwareFetch — api.anthropic.com routing", () => {
       body: JSON.stringify({ model: "claude-3-5-sonnet-20241022", messages: [] }),
     });
 
-    expect(gotScraping).toHaveBeenCalledOnce();
+    expect(gotScrapingMock).not.toHaveBeenCalled();
     expect(res.ok).toBe(true);
     expect(res.status).toBe(200);
     const data = await res.json();
     expect(data.id).toBe("msg_test");
+    globalThis.fetch = originalFetch;
   });
 
   it("falls back gracefully when got-scraping throws on non-streaming path", async () => {

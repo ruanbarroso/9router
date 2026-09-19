@@ -14,15 +14,31 @@ describe("normalizeClaudePassthrough — haiku adaptive thinking (docs 11 §1)",
     expect(out.thinking).toEqual({ type: "adaptive" });
   });
 
-  it("hoists mid-conversation system messages into top-level system", () => {
+  // `7e5f5a88` ("re-anchor passthrough cache breakpoints with 1h TTL") trocou o
+  // hoist pela DOBRA no turno vizinho, de propósito — o comentário em
+  // claude.js:227-229 diz por quê: subir para `body.system` põe conteúdo
+  // volátil (contadores de token, lembretes) na frente da conversa inteira e
+  // invalida o prefixo de cache a cada requisição. Dobrar no lugar mantém o
+  // prefixo estável. O que continua valendo é o resto do contrato: nenhuma
+  // mensagem `role: "system"` sobrevive, e o texto não se perde.
+  it("dobra mensagens system no meio da conversa no turno anterior", () => {
     const out = normalizeClaudePassthrough({
       messages: [
         { role: "user", content: "hi" },
         { role: "system", content: "be brief" },
       ],
     });
-    expect(out.system).toEqual([{ type: "text", text: "be brief" }]);
+    expect(out.system).toBeUndefined();
     expect(out.messages.every((m) => m.role !== "system")).toBe(true);
+    expect(out.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hi" },
+          { type: "text", text: "be brief" },
+        ],
+      },
+    ]);
   });
 });
 
