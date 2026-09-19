@@ -54,9 +54,11 @@ describe("Claude Code CLI context → OpenAI", () => {
     expect(JSON.stringify(out)).toContain("ENCRYPTED_BLOB");
   });
 
-  // claude-to-openai.js:155-173 — tool_result image block stringified into raw JSON
-  // KNOWN BUG
-  it.fails("tool_result image block is preserved", () => {
+  // Era KNOWN BUG (tool_result com imagem virava JSON cru). Consertado em
+  // `f4f06f29`: `claude-to-openai.js:199-232` extrai as imagens e as empurra
+  // para o turno de user seguinte, etiquetadas com o tool_use_id. O marcador
+  // `it.fails` ficou para trás e passou a falhar com "Expect test to fail".
+  it("tool_result image block is preserved", () => {
     const out = T(FORMATS.CLAUDE, FORMATS.OPENAI, {
       messages: [
         { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "screenshot", input: {} }] },

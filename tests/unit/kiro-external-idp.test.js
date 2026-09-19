@@ -105,9 +105,20 @@ describe("Kiro external_idp (CLIProxyAPI) import and refresh", () => {
     expect(headers.TokenType).toBe("EXTERNAL_IDP");
     expect(headers.tokentype).toBeUndefined();
 
-    expect(executor.buildUrl("claude-sonnet-4.5", true, 0, credentials)).toBe(
+    // `35b950be` ("route requests through current runtime surfaces") tornou a
+    // ordem q-first universal: o gateway de path do kiro.dev foi depreciado e
+    // responde 400 REQUEST_BODY_INVALID a payload moderno válido — e 400 é
+    // terminal no BaseExecutor, então kiro.dev não pode ser a primeira
+    // superfície de auth method nenhum. As superfícies Amazon recusam token
+    // estranho com 401/403, que ESSES sim caem para a próxima. O que importa
+    // para o external_idp, então, não é vir primeiro: é o CodeWhisperer estar
+    // na lista e o kiro.dev não abrir a fila.
+    const ordered = executor.getOrderedBaseUrls(credentials);
+    expect(ordered[0]).toContain("://q.");
+    expect(ordered).toContain(
       "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
     );
+    expect(ordered[0]).not.toContain("kiro.dev");
   });
 
   it("sends TokenType for external_idp Kiro usage probes", async () => {

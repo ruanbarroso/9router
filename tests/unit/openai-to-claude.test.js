@@ -193,7 +193,19 @@ describe("openaiToClaudeResponse", () => {
       }]
     };
 
-    const result = openaiToClaudeResponse(chunk, state);
+    openaiToClaudeResponse(chunk, state);
+
+    // Os argumentos de tool são BUFFERIZADOS de propósito
+    // (`response/openai-to-claude.js:216-219`: "Buffer args instead of
+    // streaming — sanitize at finish to fix bad params") e só saem como
+    // `input_json_delta` no bloco de finish (:229-239). É justamente a
+    // sanitização — o que este teste verifica — que exige os argumentos
+    // completos, então não há delta para inspecionar antes do finish. O teste
+    // pedia o delta sem nunca mandar o chunk de finish_reason.
+    const result = openaiToClaudeResponse(
+      { id: "chatcmpl-test", model: "gpt-test", choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      state
+    );
     const inputDelta = result.find(event => event.delta?.type === "input_json_delta");
 
     expect(inputDelta).toBeDefined();

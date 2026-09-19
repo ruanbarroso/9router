@@ -35,9 +35,10 @@ describe("bug: Claude → OpenAI bridge data loss", () => {
     expect(json, "thinking content lost via OpenAI bridge").toContain("secret reasoning");
   });
 
-  // claude-to-openai.js:155-173 — tool_result image block dropped (text only)
-  // KNOWN BUG
-  it.fails("tool_result with image block is not turned into raw JSON / dropped", () => {
+  // Era KNOWN BUG. Consertado em `f4f06f29`: `claude-to-openai.js:199-232`
+  // extrai as imagens do tool_result e as reemite no turno de user seguinte,
+  // etiquetadas com o tool_use_id. O `it.fails` ficou para trás.
+  it("tool_result with image block is not turned into raw JSON / dropped", () => {
     const out = T(FORMATS.CLAUDE, FORMATS.OPENAI, {
       messages: [
         { role: "assistant", content: [

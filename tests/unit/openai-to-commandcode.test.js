@@ -195,9 +195,15 @@ describe("openaiToCommandCodeRequest — native image blocks", () => {
       }],
     }, true);
 
+    // `objectContaining` e não igualdade exata: `f4f06f29` passou a emitir
+    // também `mediaType` ao lado de `mimeType`, com cobertura própria em
+    // `agent-client-fixes.test.js:186`. O que estes testes protegem é o
+    // contrato do bloco (type/image/mimeType), não a ausência de campos
+    // extras — com `toEqual` eles quebram a cada campo novo, e foi o que
+    // aconteceu aqui.
     expect(out.params.messages[0].content).toEqual([
       { type: "text", text: "what color?" },
-      { type: "image", image: DATA_URI, mimeType: "image/png" },
+      expect.objectContaining({ type: "image", image: DATA_URI, mimeType: "image/png" }),
     ]);
   });
 
@@ -212,7 +218,7 @@ describe("openaiToCommandCodeRequest — native image blocks", () => {
     }, true);
 
     expect(out.params.messages[0].content).toEqual([
-      { type: "image", image: DATA_URI, mimeType: "image/png" },
+      expect.objectContaining({ type: "image", image: DATA_URI, mimeType: "image/png" }),
     ]);
   });
 

@@ -7,6 +7,7 @@ import { parseDataUri } from "../concerns/image.js";
 import { extractTextContent } from "../formats/gemini.js";
 import { ROLE, OPENAI_BLOCK, CLAUDE_BLOCK } from "../schema/index.js";
 import { getCapabilitiesForModel } from "../../providers/capabilities.js";
+import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../config/defaultThinkingSignature.js";
 
 // Empty prefix matches real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
@@ -253,6 +254,25 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
       }
     }
   } else if (msg.role === ROLE.ASSISTANT) {
+    // Raciocínio dos provedores estilo deepseek-reasoner (GLM, Qwen, DeepSeek,
+    // Kimi, Step, Hunyuan) chega como `reasoning_content` ao lado do content.
+    // Sem este ramo a string sumia do payload inteiro: nem virava bloco
+    // thinking nem sobrevivia como texto. Vai PRIMEIRO porque a Anthropic exige
+    // que o thinking preceda o texto no turno do assistente.
+    //
+    // A assinatura é obrigatória: `formats/claude.js:260-272` descarta todo
+    // bloco thinking sem assinatura válida da Claude — um bloco não assinado
+    // seria construído aqui e jogado fora adiante, o que é o mesmo que a perda
+    // que este código existe para consertar.
+    const reasoning = typeof msg.reasoning_content === "string" ? msg.reasoning_content.trim() : "";
+    if (reasoning && !(Array.isArray(msg.content) && msg.content.some((p) => p?.type === CLAUDE_BLOCK.THINKING))) {
+      blocks.push({
+        type: CLAUDE_BLOCK.THINKING,
+        thinking: msg.reasoning_content,
+        signature: DEFAULT_THINKING_CLAUDE_SIGNATURE,
+      });
+    }
+
     if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
         if (part.type === OPENAI_BLOCK.TEXT && part.text) {

@@ -71,9 +71,11 @@ describe("OpenAI → CommandCode", () => {
     });
     expect(JSON.stringify(out)).toContain("BBBB");
     expect(JSON.stringify(out)).not.toContain("[image omitted]");
+    // Ver openai-to-commandcode.test.js: `f4f06f29` acrescentou `mediaType`
+    // ao bloco. O contrato que importa aqui é type/image/mimeType.
     expect(out.params.messages[0].content).toEqual([
       { type: "text", text: "look" },
-      { type: "image", image: "data:image/png;base64,BBBB", mimeType: "image/png" },
+      expect.objectContaining({ type: "image", image: "data:image/png;base64,BBBB", mimeType: "image/png" }),
     ]);
   });
 });
