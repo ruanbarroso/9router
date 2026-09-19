@@ -1,6 +1,7 @@
 import http from "http";
 import { URL } from "url";
 import { CODEX_CONFIG, TRAE_CONFIG, WINDSURF_CONFIG, ZED_HOSTED_CONFIG } from "../constants/oauth.js";
+import { withOAuthEgress } from "../egress.js";
 
 // Loopback origin guard for local callback proxies.
 // Legit OAuth redirects are top-level navigations (no `Origin` header); a cross-site
@@ -224,13 +225,16 @@ export function startCodexProxy(appPort) {
           const { exchangeTokens } = await import("../providers.js");
           const { createProviderConnection } = await import("@/models");
 
-          const tokenData = await exchangeTokens(
+          // The loopback callback runs on the HTTP server's own async chain,
+          // not the dashboard request's, so there is no ambient pool to inherit
+          // here — it has to be resolved again for this exchange.
+          const tokenData = await withOAuthEgress("codex", () => exchangeTokens(
             "codex",
             code,
             session.redirectUri,
             session.codeVerifier,
             state
-          );
+          ));
           const connection = await createProviderConnection({
             provider: "codex",
             authType: "oauth",
@@ -366,13 +370,13 @@ export function startXaiProxy(appPort) {
           const { exchangeTokens } = await import("../providers.js");
           const { createProviderConnection } = await import("@/models");
 
-          const tokenData = await exchangeTokens(
+          const tokenData = await withOAuthEgress("xai", () => exchangeTokens(
             "xai",
             code,
             session.redirectUri,
             session.codeVerifier,
             state
-          );
+          ));
           const connection = await createProviderConnection({
             provider: "xai",
             authType: "oauth",
@@ -498,7 +502,7 @@ export function startTraeProxy() {
       try {
         const { exchangeTokens } = await import("../providers.js");
         const { createProviderConnection } = await import("@/models");
-        const tokenData = await exchangeTokens("trae", rawCallback);
+        const tokenData = await withOAuthEgress("trae", () => exchangeTokens("trae", rawCallback));
         const connection = await createProviderConnection({
           provider: "trae",
           authType: "oauth",
@@ -600,7 +604,7 @@ export function startWindsurfProxy() {
       try {
         const { exchangeTokens } = await import("../providers.js");
         const { createProviderConnection } = await import("@/models");
-        const tokenData = await exchangeTokens("windsurf", rawCallback, null, null, session.state);
+        const tokenData = await withOAuthEgress("windsurf", () => exchangeTokens("windsurf", rawCallback, null, null, session.state));
         const connection = await createProviderConnection({
           provider: "windsurf",
           authType: "api_key",
@@ -724,14 +728,14 @@ export function startZedProxy(preferredPort = 0) {
       try {
         const { exchangeTokens } = await import("../providers.js");
         const { createProviderConnection } = await import("@/models");
-        const tokenData = await exchangeTokens(
+        const tokenData = await withOAuthEgress("zed", () => exchangeTokens(
           "zed",
           rawCallback,
           null,
           session.codeVerifier,
           session.state,
           session.systemId ? { systemId: session.systemId } : undefined,
-        );
+        ));
         const connection = await createProviderConnection({
           provider: "zed",
           authType: "oauth",

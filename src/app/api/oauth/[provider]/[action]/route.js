@@ -7,6 +7,11 @@ import {
   requestDeviceCode,
   pollForToken
 } from "@/lib/oauth/providers";
+import {
+  withOAuthEgress,
+  resolveOAuthEgress,
+  describeOAuthEgressFailure,
+} from "@/lib/oauth/egress";
 import { createProviderConnection } from "@/models";
 import { readDesktopPassToken } from "open-sse/shared/mimoAccount.js";
 import {
@@ -52,13 +57,13 @@ async function completeXaiManualCode(code, state) {
   if (!code) throw new Error("Missing xAI authorization code");
 
   try {
-    const tokenData = await exchangeTokens(
+    const tokenData = await withOAuthEgress("xai", () => exchangeTokens(
       "xai",
       code,
       session.redirectUri,
       session.codeVerifier,
       state
-    );
+    ));
     const connection = await createProviderConnection({
       provider: "xai",
       authType: "oauth",
@@ -88,11 +93,31 @@ async function completeXaiManualCode(code, state) {
  * Handles: authorize, exchange, device-code, poll
  */
 
+/**
+ * Build the 500 body for a failed OAuth call. A network-level failure gets the
+ * egress path it took appended, so "fetch failed" stops being a dead end on
+ * hosts whose outbound traffic is restricted; anything the provider actually
+ * answered is passed through untouched.
+ */
+async function oauthErrorResponse(error, provider) {
+  let message = error?.message || String(error);
+  try {
+    const explained = describeOAuthEgressFailure(error, await resolveOAuthEgress(provider), provider);
+    if (explained) message = explained;
+  } catch {
+    // Diagnosing a failure must never replace it with a different one.
+  }
+  return NextResponse.json({ error: message }, { status: 500 });
+}
+
 // GET /api/oauth/[provider]/authorize - Generate auth URL
 // GET /api/oauth/[provider]/device-code - Request device code (for device_code flow)
 export async function GET(request, { params }) {
+  // Hoisted so the catch can name the provider when diagnosing egress.
+  let providerName = "";
   try {
     const { provider, action } = await params;
+    providerName = provider;
     const { searchParams } = new URL(request.url);
 
     if (action === "authorize") {
@@ -132,7 +157,12 @@ export async function GET(request, { params }) {
       if (provider === "zed") {
         try { const p = new URL(redirectUri).port; if (p) meta.nativeAppPort = p; } catch { /* ignore */ }
       }
-      const authData = await generateAuthData(provider, redirectUri, Object.keys(meta).length ? meta : undefined);
+      // Only xai reaches the network here (OIDC discovery); for every other
+      // provider this is local URL building and the wrapper costs one settings
+      // read. Wrapping it anyway keeps the rule "network call → egress wrapper"
+      // mechanical, so the next provider that adds a fetch is covered by default.
+      const authData = await withOAuthEgress(provider, () =>
+        generateAuthData(provider, redirectUri, Object.keys(meta).length ? meta : undefined));
       return NextResponse.json(authData);
     }
 
@@ -241,7 +271,6 @@ export async function GET(request, { params }) {
         return NextResponse.json({ error: "Provider does not support device code flow" }, { status: 400 });
       }
 
-      const authData = await generateAuthData(provider, null);
       const startUrl = searchParams.get("start_url");
       const region = searchParams.get("region");
       const authMethod = searchParams.get("auth_method");
@@ -265,13 +294,17 @@ export async function GET(request, { params }) {
         "qoder",
         "grok-cli",
       ];
-      let deviceData;
-      if (noPkceDeviceProviders.includes(provider)) {
-        deviceData = await requestDeviceCode(provider, undefined, deviceOptions);
-      } else {
-        // Qwen and other PKCE providers
-        deviceData = await requestDeviceCode(provider, authData.codeChallenge, deviceOptions);
-      }
+      // One store for both calls, not one each: the PKCE pair and the device
+      // code belong to the same handshake and must leave through the same
+      // relay, from a single pool decision.
+      const { authData, deviceData } = await withOAuthEgress(provider, async () => {
+        const auth = await generateAuthData(provider, null);
+        const device = noPkceDeviceProviders.includes(provider)
+          ? await requestDeviceCode(provider, undefined, deviceOptions)
+          // Qwen and other PKCE providers
+          : await requestDeviceCode(provider, auth.codeChallenge, deviceOptions);
+        return { authData: auth, deviceData: device };
+      });
 
       return NextResponse.json({
         ...deviceData,
@@ -284,15 +317,18 @@ export async function GET(request, { params }) {
     return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (error) {
     console.log("OAuth GET error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return oauthErrorResponse(error, providerName);
   }
 }
 
 // POST /api/oauth/[provider]/exchange - Exchange code for tokens and save
 // POST /api/oauth/[provider]/poll - Poll for token (device_code flow)
 export async function POST(request, { params }) {
+  // Hoisted so the catch can name the provider when diagnosing egress.
+  let providerName = "";
   try {
     const { provider, action } = await params;
+    providerName = provider;
     let body;
     try {
       body = await request.json();
@@ -387,7 +423,7 @@ export async function POST(request, { params }) {
           return NextResponse.json({ error: "Missing token or callback URL" }, { status: 400 });
         }
         try {
-          const tokenData = await exchangeTokens(provider, token, null, null, state);
+          const tokenData = await withOAuthEgress(provider, () => exchangeTokens(provider, token, null, null, state));
           const connection = await createProviderConnection({
             provider,
             authType: provider === "windsurf" ? "api_key" : "oauth",
@@ -462,10 +498,10 @@ export async function POST(request, { params }) {
       // Exchange code for tokens (meta carries provider-specific params, e.g. gitlab clientId/baseUrl).
       // systemId (Zed) is merged into meta so the login attempt's own id is
       // used instead of a freshly prepared one. Ignored by other providers.
-      const tokenData = await exchangeTokens(provider, code, redirectUri, codeVerifier, state, {
+      const tokenData = await withOAuthEgress(provider, () => exchangeTokens(provider, code, redirectUri, codeVerifier, state, {
         ...(meta || {}),
         ...(systemId ? { systemId } : {}),
-      });
+      }));
 
       // Save to database
       const connection = await createProviderConnection({
@@ -501,10 +537,10 @@ export async function POST(request, { params }) {
       let result;
       if (noPkceProviders.includes(provider)) {
         // kimi needs extraData._kimiDeviceId for stable X-Msh-Device-Id (CLIProxyAPI parity)
-        result = await pollForToken(provider, deviceCode, null, extraData);
+        result = await withOAuthEgress(provider, () => pollForToken(provider, deviceCode, null, extraData));
       } else if (provider === "kiro") {
         // Kiro needs extraData (clientId, clientSecret) from device code response
-        result = await pollForToken(provider, deviceCode, null, extraData);
+        result = await withOAuthEgress(provider, () => pollForToken(provider, deviceCode, null, extraData));
       } else if (provider === "qoder") {
         // Qoder needs both the PKCE verifier (codeVerifier) and the machineId
         // captured at device-code time (extraData._qoderMachineId) so
@@ -512,13 +548,13 @@ export async function POST(request, { params }) {
         if (!codeVerifier) {
           return NextResponse.json({ error: "Missing code verifier" }, { status: 400 });
         }
-        result = await pollForToken(provider, deviceCode, codeVerifier, extraData);
+        result = await withOAuthEgress(provider, () => pollForToken(provider, deviceCode, codeVerifier, extraData));
       } else {
         // Qwen and other PKCE providers
         if (!codeVerifier) {
           return NextResponse.json({ error: "Missing code verifier" }, { status: 400 });
         }
-        result = await pollForToken(provider, deviceCode, codeVerifier);
+        result = await withOAuthEgress(provider, () => pollForToken(provider, deviceCode, codeVerifier));
       }
 
       if (result.success) {
@@ -566,6 +602,6 @@ export async function POST(request, { params }) {
     return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (error) {
     console.log("OAuth POST error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return oauthErrorResponse(error, providerName);
   }
 }
