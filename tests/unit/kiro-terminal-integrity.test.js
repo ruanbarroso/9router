@@ -82,6 +82,20 @@ function response(frames, status = 200) {
   }), { status, statusText: status === 200 ? "OK" : "Upstream Error" });
 }
 
+// 401 é status de fallback de ENDPOINT no kiro
+// (`KIRO_ENDPOINT_FALLBACK_STATUSES = {401,403,404}`, kiroConstants.js:28): o
+// executor tenta os três baseUrls antes de desistir, de propósito — um token
+// recusado numa superfície costuma valer na outra. Com `mockResolvedValueOnce`
+// só duas vezes, a TERCEIRA chamada devolvia `undefined`, virava
+// `TypeError: Cannot read properties of undefined (reading 'headers')`, caía na
+// política de retry de 502 (3 tentativas × 3000ms, runtimeConfig.js:80) e o
+// teste estourava os 5000ms. `mockImplementation` responde 401 a todas as
+// tentativas, que é o cenário que o teste quer: retry HTTP falhando de verdade.
+// Corpo novo por chamada porque um `Response` só pode ser lido uma vez.
+function unauthorized(body) {
+  return new Response(body, { status: 401, statusText: "Unauthorized" });
+}
+
 function controlledResponse(frames = []) {
   let controller;
   const value = new Response(new ReadableStream({
@@ -707,10 +721,7 @@ describe("Kiro terminal integrity recovery", () => {
   it("surfaces retry HTTP failures as SSE after heartbeat commits headers", async () => {
     fetchMock
       .mockResolvedValueOnce(response([]))
-      .mockResolvedValueOnce(new Response("unauthorized", {
-        status: 401,
-        statusText: "Unauthorized"
-      }));
+      .mockImplementation(async () => unauthorized("unauthorized"));
 
     const result = await execute();
     const body = await result.response.text();
@@ -723,10 +734,8 @@ describe("Kiro terminal integrity recovery", () => {
   it("bounds the retry HTTP error body", async () => {
     fetchMock
       .mockResolvedValueOnce(response([]))
-      .mockResolvedValueOnce(new Response(`error-start-${"x".repeat(10_000)}-error-tail`, {
-        status: 401,
-        statusText: "Unauthorized"
-      }));
+      .mockImplementation(async () =>
+        unauthorized(`error-start-${"x".repeat(10_000)}-error-tail`));
 
     const body = await (await execute()).response.text();
 

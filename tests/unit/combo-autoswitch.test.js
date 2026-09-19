@@ -35,11 +35,17 @@ describe("detectRequiredCapabilities", () => {
     expect(r.has("vision")).toBe(true);
   });
 
-  it("web_search tool -> search", () => {
+  it("web_search tool NÃO exige 'search' — auto-switch de busca está desligado", () => {
+    // `b282f055` desligou a detecção de "search" de propósito: o comentário em
+    // `combo.js:181` diz "search: temporarily disabled in auto-switch (feature
+    // not wired yet)". Enquanto não houver consumidor, exigir a capability só
+    // reordenaria combos por um critério que ninguém honra. O teste guarda o
+    // estado ATUAL — quando a feature for ligada, ele falha e pede revisão,
+    // que é o comportamento certo para um desligamento temporário.
     const r = detectRequiredCapabilities({ messages: [{ role: "user", content: "q" }], tools: [
       { type: "web_search" },
     ] });
-    expect(r.has("search")).toBe(true);
+    expect(r.has("search")).toBe(false);
   });
 
   it("responses input_image -> vision", () => {
@@ -66,9 +72,14 @@ describe("reorderByCapabilities", () => {
   });
 
   it("keeps order when no model matches", () => {
+    // `toEqual`, não `toBe`: a identidade do array só é preservada pelo early
+    // return de `combo.js:64` (`!required || required.size === 0 || ... ||
+    // models.length <= 1`). Com uma capability exigida e 2+ modelos a função
+    // sempre reconstrói via `.map().sort().map()`. O contrato aqui é a ORDEM
+    // — empate de tier cai no índice original —, não a instância.
     const models = ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"];
     const out = reorderByCapabilities(models, new Set(["vision"]));
-    expect(out).toBe(models);
+    expect(out).toEqual(models);
   });
 
   it("single model -> unchanged", () => {
