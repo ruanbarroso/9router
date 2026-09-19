@@ -7,8 +7,19 @@ import { filterToOpenAIFormat } from "../../open-sse/translator/formats/openai.j
 import { parseSSELine } from "../../open-sse/utils/streamHelpers.js";
 
 describe("request normalization", () => {
-  it("claudeToOpenAIRequest flattens text-only content arrays into string", () => {
-    const body = {
+  // `collapseTextParts` (concerns/message.js:5) colapsa UM part de texto para
+  // string e devolve o array intacto em qualquer outro caso — nunca juntou dois
+  // parts com "\n". Essa é a forma desde `32e3980a`, o commit que escreveu ESTE
+  // arquivo de teste, então a asserção de junção nunca passou. E preservar o
+  // array é o comportamento certo: juntar apaga a fronteira entre os blocos,
+  // que é o que carrega `cache_control` por bloco no caminho Claude.
+  it("claudeToOpenAIRequest colapsa um único part de texto e preserva os demais", () => {
+    const um = claudeToOpenAIRequest("gpt-oss:120b", {
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    }, true);
+    expect(um.messages[0].content).toBe("hi");
+
+    const dois = claudeToOpenAIRequest("gpt-oss:120b", {
       messages: [
         {
           role: "user",
@@ -18,10 +29,11 @@ describe("request normalization", () => {
           ],
         },
       ],
-    };
-
-    const result = claudeToOpenAIRequest("gpt-oss:120b", body, true);
-    expect(result.messages[0].content).toBe("hi\nthere");
+    }, true);
+    expect(dois.messages[0].content).toEqual([
+      { type: "text", text: "hi" },
+      { type: "text", text: "there" },
+    ]);
   });
 
   it("claudeToOpenAIRequest preserves multimodal arrays", () => {
@@ -48,7 +60,7 @@ describe("request normalization", () => {
     expect(Array.isArray(result.messages[0].content)).toBe(true);
   });
 
-  it("filterToOpenAIFormat flattens text-only arrays to string", () => {
+  it("filterToOpenAIFormat preserva arrays de texto sem juntar", () => {
     const body = {
       messages: [
         {
@@ -61,11 +73,16 @@ describe("request normalization", () => {
       ],
     };
 
+    // `filterToOpenAIFormat` FILTRA tipos de bloco não-OpenAI; ela não colapsa
+    // nem junta. Os dois parts de texto saem como entraram.
     const result = filterToOpenAIFormat(JSON.parse(JSON.stringify(body)));
-    expect(result.messages[0].content).toBe("a\nb");
+    expect(result.messages[0].content).toEqual([
+      { type: "text", text: "a" },
+      { type: "text", text: "b" },
+    ]);
   });
 
-  it("translateRequest keeps /v1/messages Claude->OpenAI text payloads string-safe", () => {
+  it("translateRequest Claude->OpenAI preserva todos os blocos de texto do turno", () => {
     const body = {
       model: "ollama/gpt-oss:120b",
       system: [{ type: "text", text: "You are helpful." }],
@@ -91,9 +108,14 @@ describe("request normalization", () => {
       "ollama",
     );
 
+    // Mesma regra de `collapseTextParts`: dois parts continuam array ponta a
+    // ponta. O que o caminho /v1/messages garante é que nenhum bloco de texto
+    // se perde, não que vire string.
     const userMessage = result.messages.find((m) => m.role === "user");
-    expect(typeof userMessage.content).toBe("string");
-    expect(userMessage.content).toBe("hello\nworld");
+    expect(userMessage.content).toEqual([
+      { type: "text", text: "hello" },
+      { type: "text", text: "world" },
+    ]);
   });
 
   it("translateRequest strips unsupported Anthropic output_config for MiniMax Claude-compatible endpoints", () => {
@@ -171,12 +193,21 @@ describe("request normalization", () => {
       done: false,
     });
 
-    const parsed = parseSSELine(raw);
+    // O ramo NDJSON é fechado atrás de `format === FORMATS.OLLAMA`
+    // (streamHelpers.js:12). Sem o segundo argumento a função cai no ramo SSE,
+    // exige o prefixo "data:" e devolve null — que é exatamente o contrato,
+    // porque NDJSON cru e SSE são indistinguíveis sem o formato do alvo. Os
+    // dois chamadores de produção (`utils/stream.js:246,415`) passam
+    // `targetFormat`; o teste não passava.
+    const parsed = parseSSELine(raw, FORMATS.OLLAMA);
     expect(parsed).toEqual({
       model: "gpt-oss:120b",
       message: { role: "assistant", content: "hello" },
       done: false,
     });
+
+    // E sem o formato: null, não um parse acidental.
+    expect(parseSSELine(raw)).toBeNull();
   });
 
   it("parseSSELine still supports SSE data lines", () => {

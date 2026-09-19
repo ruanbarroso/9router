@@ -17,7 +17,17 @@ beforeAll(async () => {
   await db.initDb();
 });
 
-afterAll(() => {
+afterAll(async () => {
+  // Fechar o handle do SQLite ANTES do rmSync: no Windows um arquivo com
+  // handle aberto não pode ser apagado, o rmSync dava EPERM e derrubava o
+  // arquivo de teste inteiro no teardown mesmo com todos os testes passando.
+  try {
+    const { getAdapter } = await import("@/lib/db/driver.js");
+    (await getAdapter())?.close?.();
+  } catch { /* teardown não deve mascarar falha de teste */ }
+  // O adapter vive em `global._dbAdapter` (driver.js:4) e sobrevive ao
+  // `vi.resetModules()`; sem zerar, o próximo arquivo reusa o handle fechado.
+  global._dbAdapter = { instance: null, initPromise: null, logged: false };
   if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
@@ -29,7 +39,15 @@ describe("DB Concurrency — atomic safety", () => {
     const promises = [];
     for (let i = 0; i < N; i++) {
       promises.push(db.saveRequestUsage({
-        provider: "openai", model: "gpt-4", connectionId: "c1",
+        // `connectionId` único por requisição. `0d216689` ("deduplicate
+        // identical usage writes") colapsa escritas indistinguíveis, e a chave
+        // de dedupe (usageRepo.js:257-272) é
+        // timestamp+provider+model+connectionId+apiKey+tokens. Cem escritas
+        // idênticas disparadas no mesmo milissegundo batem TODAS na mesma
+        // chave: o resultado era 2, e isso é a dedupe funcionando, não perda
+        // de escrita. Requisições reais concorrentes vêm de conexões
+        // diferentes — é esse cenário que este teste quer medir.
+        provider: "openai", model: "gpt-4", connectionId: `c1-${i}`,
         tokens: { prompt_tokens: 10, completion_tokens: 5 },
         endpoint: "/v1/chat", status: "ok",
       }));
@@ -70,7 +88,10 @@ describe("DB Concurrency — atomic safety", () => {
     const ops = [];
     for (let i = 0; i < 50; i++) {
       ops.push(db.saveRequestUsage({
-        provider: "anthropic", model: `m-${i % 3}`, connectionId: "c2",
+        // `connectionId` único pelo mesmo motivo do primeiro teste: com
+        // `model: m-${i % 3}` e connectionId fixo, as 50 escritas caíam em 3
+        // chaves de dedupe e o total vinha 48.
+        provider: "anthropic", model: `m-${i % 3}`, connectionId: `c2-${i}`,
         tokens: { prompt_tokens: 20 }, status: "ok",
       }));
       ops.push(db.setModelAlias(`a-${i}`, `target-${i}`));
@@ -154,7 +175,8 @@ describe("DB Concurrency — atomic safety", () => {
     const promises = [];
     for (let i = 0; i < N; i++) {
       promises.push(db.saveRequestUsage({
-        provider: "google", model: "gemini-pro", connectionId: "cG",
+        // Idem: sem o sufixo, as 50 escritas viravam 1.
+        provider: "google", model: "gemini-pro", connectionId: `cG-${i}`,
         tokens: { prompt_tokens: 100, completion_tokens: 50 },
         status: "ok",
       }));
@@ -167,5 +189,22 @@ describe("DB Concurrency — atomic safety", () => {
     expect(g.requests).toBe(N);
     expect(g.promptTokens).toBe(N * 100);
     expect(g.completionTokens).toBe(N * 50);
+  });
+
+  it("escritas realmente idênticas são deduplicadas (0d216689)", async () => {
+    // O outro lado da moeda dos três testes acima: quando a chave de dedupe
+    // coincide de verdade, colapsar é o comportamento desejado — é o que evita
+    // que um retry contabilize a mesma requisição duas vezes. Timestamp fixo
+    // para não depender do relógio.
+    const timestamp = new Date().toISOString();
+    const entry = () => ({
+      timestamp, provider: "dedupe-prov", model: "m", connectionId: "cD",
+      tokens: { prompt_tokens: 7, completion_tokens: 3 }, status: "ok",
+    });
+
+    await Promise.all(Array.from({ length: 20 }, () => db.saveRequestUsage(entry())));
+
+    const hist = await db.getUsageHistory({ provider: "dedupe-prov" });
+    expect(hist.length).toBe(1);
   });
 });

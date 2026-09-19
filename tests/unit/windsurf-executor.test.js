@@ -165,7 +165,11 @@ describe("WindsurfExecutor class", () => {
     const ex = new WindsurfExecutor();
     expect(ex.provider).toBe("windsurf");
     expect(ex.config).toBeDefined();
-    expect(ex.config.baseUrl).toContain("server.self-serve.windsurf.com");
+    // O host de transporte é `server.codeium.com` (executors/windsurf.js:15 e
+    // registry/windsurf.js:22). `server.self-serve.windsurf.com` é OUTRA coisa:
+    // só o ramo 4 da cadeia de auth, o do token Devin `auth1_...`
+    // (registry/windsurf.js:37,44) — nunca foi o endpoint de chat.
+    expect(ex.config.baseUrl).toContain("server.codeium.com");
     expect(typeof ex.execute).toBe("function");
   });
 
@@ -187,12 +191,24 @@ describe("WindsurfExecutor class", () => {
 
   it("buildUrl returns the GetChatMessage endpoint", () => {
     const ex = new WindsurfExecutor();
-    expect(ex.buildUrl()).toBe("https://server.self-serve.windsurf.com/exa.language_server_pb.LanguageServerService/GetChatMessage");
+    expect(ex.buildUrl()).toBe("https://server.codeium.com/exa.language_server_pb.LanguageServerService/GetChatMessage");
   });
 
-  it("PROVIDERS.windsurf baseUrl is the chat endpoint (registry in sync)", () => {
-    expect(PROVIDERS.windsurf.baseUrl).toBe(
-      "https://server.self-serve.windsurf.com/exa.language_server_pb.LanguageServerService/GetChatMessage"
-    );
+  it("windsurf está fora do REGISTRY e o executor não depende disso", () => {
+    // `registry/index.js:117,240` deixa o windsurf comentado de propósito —
+    // "hidden, no tool calling support (windsurf gRPC skip ToolCallChunk)" —
+    // então `PROVIDERS.windsurf` é undefined por desenho, e o teste anterior
+    // ("registry in sync") pedia sincronia com uma entrada que não é montada.
+    // O executor segue funcionando porque tem o host próprio em
+    // `executors/windsurf.js:15`. Este teste guarda as DUAS metades: se alguém
+    // reabilitar o provider, o baseUrl do registry tem que bater com o do
+    // executor — senão o chat vai para um host e o catálogo aponta para outro.
+    const CHAT_URL =
+      "https://server.codeium.com/exa.language_server_pb.LanguageServerService/GetChatMessage";
+    if (PROVIDERS.windsurf) {
+      expect(PROVIDERS.windsurf.baseUrl).toBe(CHAT_URL);
+    } else {
+      expect(new WindsurfExecutor().buildUrl()).toBe(CHAT_URL);
+    }
   });
 });
