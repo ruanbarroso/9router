@@ -47,6 +47,25 @@
 # desses três ou tirar o import dinâmico do corpo do teste. Não fiz aqui porque
 # alterar tempo de teste durante uma migração esconde exatamente o tipo de
 # lentidão que a migração poderia introduzir.
+#
+# Adendo 2026-09-19 (PR 4165, opencode cloak tools)
+# ------------------------------------------------
+# A cauda de timeout é MAIOR que as quatro entradas abaixo. Cinco rodadas
+# completas durante a integração do PR 4165 (3 com a mudança, 2 na árvore limpa)
+# deram 240/236/236 e 235/234 falhas, e estes quatro testes falharam ao menos uma
+# vez SEM serem tocados pela mudança:
+#
+#   1/3  codex-refresh-token             :: ... (token rotation)          5061 ms
+#   1/3  codex-reset-credits             :: returns normalized reset ...  5026 ms
+#   2/3  minimax-transport-target-format :: keeps OpenAI image blocks ... 5122 ms
+#   1/3  model-catalog-scope             :: rebuilds an older-schema ...  5672 ms
+#
+# Os quatro são TIMEOUT contra o `testTimeout` de 5000 ms, não falha de
+# asserção — mesma causa das entradas listadas abaixo. Deliberadamente NÃO
+# foram adicionados à lista: suprimi-los tiraria quatro testes do portão de vez,
+# e ao contrário dos quatro abaixo eles não falham com frequência suficiente
+# para deixar o portão inútil. Se o portão acusar um deles, releia esta nota e
+# confirme à mão, isolado, antes de tratar como regressão.
 
 tests/unit/xai-oauth-service.test.js :: xai/oauth service generates dashboard auth data with CLIProxyAPI PKCE size and discovered endpoints
 tests/unit/xai-oauth-service.test.js :: xai/oauth service exchanges dashboard codes against the discovered xAI token endpoint
