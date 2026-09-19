@@ -76,10 +76,14 @@ const normalize = (value) => {
  * Extract tokens via better-sqlite3 (bundled dependency).
  * This is the preferred strategy — no external CLI required.
  */
-function extractTokensViaBetterSqlite(dbPath) {
-  // Dynamic require so the route stays importable even if native bindings fail
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const Database = require("better-sqlite3");
+async function extractTokensViaBetterSqlite(dbPath) {
+  // Import dinâmico, não `require`: este módulo é ESM, então `require` não
+  // existe fora do bundle do webpack — fora dele a chamada lançava
+  // `ReferenceError: require is not defined`, o catch do chamador engolia, e a
+  // estratégia "better-sqlite3 embutido" era no-op silencioso que sempre caía
+  // no CLI do sqlite3. `import()` funciona nos dois mundos e mantém a semântica
+  // de dependência opcional (a falha de binding nativo continua rejeitando).
+  const Database = (await import("better-sqlite3")).default;
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 
   const query = (key) => {
@@ -220,7 +224,7 @@ export async function GET() {
 
     // Strategy 1: better-sqlite3 (bundled — no external tools required)
     try {
-      const tokens = extractTokensViaBetterSqlite(dbPath);
+      const tokens = await extractTokensViaBetterSqlite(dbPath);
       if (tokens.accessToken && tokens.machineId) {
         return NextResponse.json({
           found: true,
