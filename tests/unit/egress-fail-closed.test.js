@@ -379,3 +379,66 @@ describe("DNS for the MITM bypass", () => {
     });
   });
 });
+
+describe("proxyAwareFetch inherits the ambient egress store", () => {
+  let proxyAwareFetch;
+  let runWithProxy;
+
+  beforeEach(async () => {
+    ({ proxyAwareFetch } = await import("../../open-sse/utils/proxyFetch.js"));
+    ({ runWithProxy } = await import("../../open-sse/utils/egressContext.js"));
+    process.env.NINEROUTER_REQUIRE_PROXY = "1";
+  });
+
+  afterEach(() => {
+    delete process.env.NINEROUTER_REQUIRE_PROXY;
+  });
+
+  const RELAY = {
+    connectionProxyEnabled: true,
+    vercelRelayUrl: "https://relay.blocked.invalid/",
+    strictProxy: true,
+  };
+
+  // The regression this pins down was found on the real host, not here: a
+  // Kiro token refresh escaped an enclosing catalog-egress store and was
+  // stopped by the firewall with `no-proxy-configured → oidc.…amazonaws.com`.
+  // The cause was `refreshKiroToken(token, psd, log)` — a third parameter that
+  // defaults to null, passed straight through to proxyAwareFetch, where null
+  // used to mean "go direct" instead of "ask the chain".
+  it("uses the ambient bag when the caller passes none", async () => {
+    const err = await runWithProxy(RELAY, () =>
+      proxyAwareFetch("https://oidc.us-east-1.amazonaws.com/token", {}).catch((e) => e));
+    // It tried the relay (and was blocked for being public) rather than
+    // reporting the target as an unproxied direct exit.
+    expect(err.message).toContain("vercel-relay");
+    expect(err.message).not.toContain("no-proxy-configured");
+  });
+
+  it("treats an explicit null the same as no argument", async () => {
+    // This is the exact shape of the call that leaked: a defaulted parameter
+    // threaded through, arriving as an explicit null.
+    const err = await runWithProxy(RELAY, () =>
+      proxyAwareFetch("https://oidc.us-east-1.amazonaws.com/token", {}, null).catch((e) => e));
+    expect(err.message).toContain("vercel-relay");
+  });
+
+  it("lets an explicit bag win over the ambient one", async () => {
+    // Inheriting must not become overriding: a caller that resolved its own
+    // pool has more context than the chain it happens to run inside.
+    const err = await runWithProxy(RELAY, () =>
+      proxyAwareFetch("https://oidc.us-east-1.amazonaws.com/token", {}, {
+        connectionProxyEnabled: true,
+        connectionProxyUrl: "socks5://explicit.local:1080",
+      }).catch((e) => e));
+    expect(err.message).toMatch(/SOCKS proxies are not supported/);
+  });
+
+  it("still reports a direct exit when there is no store at all", async () => {
+    // Pairs with the first test: same URL, no surrounding store, and the
+    // guard must still name the exit rather than silently inheriting nothing.
+    const err = await proxyAwareFetch("https://oidc.us-east-1.amazonaws.com/token", {}).catch((e) => e);
+    expect(err.code).toBe("EGRESS_DIRECT_BLOCKED");
+    expect(err.message).toContain("no-proxy-configured");
+  });
+});

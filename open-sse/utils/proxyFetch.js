@@ -296,8 +296,16 @@ function assertProxyResponse(response, proxyOptions) {
   return response;
 }
 
-export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
+export async function proxyAwareFetch(url, options = {}, explicitProxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
+
+  // No bag from the caller means "whatever this async chain established", not
+  // "go direct". Dozens of call sites pass the third argument through from a
+  // parameter that defaults to null — `refreshKiroToken(token, psd, log)` is
+  // the one that exposed this — and reading that null as an instruction let
+  // them out past an enclosing withOAuthEgress/withCatalogEgress store. An
+  // explicit bag still wins; only the absence of one defers.
+  const proxyOptions = explicitProxyOptions ?? getAmbientProxyOptions();
 
   // Vercel relay: forward request via relay headers
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
@@ -384,7 +392,9 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
  * pool without the call site knowing it exists.
  */
 async function patchedFetch(url, options = {}) {
-  return proxyAwareFetch(url, options, getAmbientProxyOptions());
+  // proxyAwareFetch consults the ambient store itself now; passing null here
+  // is the same thing said once instead of twice.
+  return proxyAwareFetch(url, options, null);
 }
 
 // Idempotency guard — only patch once to avoid wrapping multiple times
