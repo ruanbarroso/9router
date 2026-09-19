@@ -1,5 +1,6 @@
 import { PROVIDERS } from "../config/providers.js";
 import { OAUTH_ENDPOINTS, REFRESH_LEAD_MS } from "../config/appConstants.js";
+import { runWithProxy } from "../utils/egressContext.js";
 import {
   refreshXaiToken,
   refreshAccessToken,
@@ -41,6 +42,56 @@ export {
 };
 
 export const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+
+/**
+ * Resolve the proxy pool this connection's refresh must egress through.
+ *
+ * The pool is read HERE, from the credentials, rather than being passed in by
+ * callers. That is deliberate: it fixes oauthCredentialManager, the usage route
+ * and the SSE background refresher at once, with zero signature changes at any
+ * call site — and it makes the fourth argument that executors/grok-cli.js:355
+ * already discards harmless instead of misleading.
+ *
+ * The import is dynamic because connectionProxy reaches the database, and a
+ * static edge would drag the whole DB layer into OAuth paths that run with no
+ * database open at all (the CLI, the standalone engine).
+ *
+ * Never throws: a pool lookup that fails must not brick every refresh on the
+ * box. It returns null, which under NINEROUTER_REQUIRE_PROXY means the request
+ * then fails loudly by name at the egress guard instead of leaking direct.
+ */
+// Memoised so the import is resolved once per process rather than on every
+// refresh. Two concurrent refreshes each doing their own dynamic import can
+// race and end up on different module instances — which showed up as one
+// connection silently resolving no pool while the other resolved one.
+let _proxyModules = null;
+function loadProxyModules() {
+  if (!_proxyModules) {
+    _proxyModules = Promise.all([
+      import("../../src/lib/network/connectionProxy.js"),
+      import("../../src/lib/network/proxyOptions.js"),
+    ]).catch((error) => {
+      _proxyModules = null; // a transient failure must not poison every later refresh
+      throw error;
+    });
+  }
+  return _proxyModules;
+}
+
+async function resolveRefreshProxyOptions(credentials, log) {
+  const psd = credentials?.providerSpecificData;
+  if (!psd) return null;
+  try {
+    const [{ resolveConnectionProxyConfig }, { toProxyOptions }] = await loadProxyModules();
+    const resolved = await resolveConnectionProxyConfig(psd);
+    if (!resolved || resolved.source === "none") return null;
+    log?.debug?.("TOKEN_REFRESH", `egress via ${resolved.source}${resolved.proxyPoolId ? ` (${resolved.proxyPoolId})` : ""}`);
+    return toProxyOptions(resolved);
+  } catch (error) {
+    log?.warn?.("TOKEN_REFRESH", `proxy pool lookup failed, refreshing without pool: ${error.message}`);
+    return null;
+  }
+}
 
 export function isUnrecoverableRefreshError(result) {
   return (
@@ -168,21 +219,30 @@ export async function getAccessToken(provider, credentials, log) {
 }
 
 async function _getAccessTokenInternal(provider, credentials, log) {
-  if (provider === "gemini") {
-    return refreshGoogleToken(credentials.refreshToken, PROVIDERS.gemini.clientId, PROVIDERS.gemini.clientSecret, log);
-  }
-  const handler = REFRESH_HANDLERS[provider];
-  if (!handler) {
-    log?.warn?.("TOKEN_REFRESH", `Unsupported provider for token refresh: ${provider}`);
-    return null;
-  }
-  return handler(credentials, log);
+  // One pool lookup per refresh, not per fetch: the handler below may issue
+  // several requests (kiro re-resolves its profile ARN) and they must all
+  // leave through the same proxy, from the same decision.
+  const proxyOptions = await resolveRefreshProxyOptions(credentials, log);
+  return runWithProxy(proxyOptions, () => {
+    if (provider === "gemini") {
+      return refreshGoogleToken(credentials.refreshToken, PROVIDERS.gemini.clientId, PROVIDERS.gemini.clientSecret, log);
+    }
+    const handler = REFRESH_HANDLERS[provider];
+    if (!handler) {
+      log?.warn?.("TOKEN_REFRESH", `Unsupported provider for token refresh: ${provider}`);
+      return null;
+    }
+    return handler(credentials, log);
+  });
 }
 
 export async function refreshTokenByProvider(provider, credentials, log) {
   if (!credentials.refreshToken) return null;
-  const handler = REFRESH_HANDLERS[provider];
-  return handler ? handler(credentials, log) : refreshAccessToken(provider, credentials.refreshToken, credentials, log);
+  const proxyOptions = await resolveRefreshProxyOptions(credentials, log);
+  return runWithProxy(proxyOptions, () => {
+    const handler = REFRESH_HANDLERS[provider];
+    return handler ? handler(credentials, log) : refreshAccessToken(provider, credentials.refreshToken, credentials, log);
+  });
 }
 
 export function formatProviderCredentials(provider, credentials, log) {

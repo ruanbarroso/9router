@@ -2,6 +2,7 @@ import { Readable } from "stream";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
 import { assertDirectEgressAllowed, isUpstreamHeadersTimeout } from "./egressPolicy.js";
+import { getAmbientProxyOptions } from "./egressContext.js";
 
 // Proxy authentication failed: the proxy itself rejected us, so this is a proxy
 // fault even though it arrives as a response rather than an exception. 502/503
@@ -399,10 +400,15 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
 }
 
 /**
- * Patched global fetch with env-proxy support and MITM DNS bypass
+ * Patched global fetch with env-proxy support and MITM DNS bypass.
+ *
+ * Reads the ambient pool (see utils/egressContext.js) rather than assuming
+ * none. Outside any `runWithProxy` store this is null and behaviour is
+ * unchanged; inside one, every bare `fetch()` in the chain routes through the
+ * pool without the call site knowing it exists.
  */
 async function patchedFetch(url, options = {}) {
-  return proxyAwareFetch(url, options, null);
+  return proxyAwareFetch(url, options, getAmbientProxyOptions());
 }
 
 // Idempotency guard — only patch once to avoid wrapping multiple times
