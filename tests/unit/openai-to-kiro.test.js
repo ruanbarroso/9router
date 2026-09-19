@@ -11,7 +11,20 @@ import { openaiToKiroRequest } from "../../open-sse/translator/request/openai-to
 
 const contentOf = (result) =>
   result.conversationState.currentMessage.userInputMessage.content;
-const systemPromptOf = (result) => result.systemPrompt || "";
+
+// O payload do Kiro NÃO carrega mais `systemPrompt` no topo. `1fc2a81d`
+// ("remove redundant top-level systemPrompt field from payload") tirou o campo
+// dos dois tradutores e `1892ed77` fechou os dois writers que restavam, porque
+// kiro.dev responde 400 REQUEST_BODY_INVALID a qualquer corpo com o campo.
+// O prompt de sistema passou a viajar como prefixo do `content` do primeiro
+// turno de usuário. Estes testes ficaram para trás: liam `result.systemPrompt`,
+// recebiam `undefined`, e `expect(undefined).not.toContain(...)` LANÇA no
+// vitest em vez de passar — por isso as negativas também falhavam.
+const systemPromptOf = (result) => contentOf(result) || "";
+
+// A parte estável do prefixo: tudo antes do carimbo de hora, que muda a cada
+// chamada de propósito.
+const stablePrefixOf = (result) => systemPromptOf(result).split("[Context:")[0];
 
 describe("openaiToKiroRequest", () => {
   describe("basic message conversion", () => {
@@ -568,7 +581,7 @@ describe("openaiToKiroRequest", () => {
       expect(systemPromptOf(result)).toContain("<max_thinking_length>16000</max_thinking_length>");
     });
 
-    it("keeps top-level systemPrompt stable across turns", () => {
+    it("keeps the system prefix stable across turns, com o tempo fora dele", () => {
       const first = openaiToKiroRequest(
         "claude-sonnet-4.6-thinking",
         { messages: [{ role: "user", content: "first" }] },
@@ -582,9 +595,9 @@ describe("openaiToKiroRequest", () => {
         {}
       );
 
-      expect(first.systemPrompt).toBe(second.systemPrompt);
-      expect(first.systemPrompt).not.toContain("Current time");
-      expect(first.conversationState.currentMessage.userInputMessage.content).toContain("Current time");
+      expect(stablePrefixOf(first)).toBe(stablePrefixOf(second));
+      expect(stablePrefixOf(first)).not.toContain("Current time");
+      expect(contentOf(first)).toContain("Current time");
     });
 
     it("replays frozen msg0 for explicit Kiro sessions while keeping current time fresh", () => {
