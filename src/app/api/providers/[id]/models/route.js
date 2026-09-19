@@ -11,6 +11,7 @@ import { resolveQoderModels } from "open-sse/services/qoderModels.js";
 import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { toProxyOptions } from "@/lib/network/proxyOptions";
+import { withCatalogEgress } from "@/lib/network/catalogEgress";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { resolveClineModels, resolveClinepassModels } from "open-sse/services/clinepassModels.js";
@@ -514,6 +515,16 @@ export async function GET(request, { params }) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
 
+    // Every upstream call below belongs to this one connection, so they all
+    // leave through its pool — including a token refresh triggered on the way.
+    return await withCatalogEgress(connection, () => fetchProviderModels(connection));
+  } catch (error) {
+    console.log("Error fetching provider models:", error);
+    return NextResponse.json({ error: "Failed to fetch models" }, { status: 500 });
+  }
+}
+
+async function fetchProviderModels(connection) {
     if (isOpenAICompatibleProvider(connection.provider)) {
       const baseUrl = connection.providerSpecificData?.baseUrl;
       if (!baseUrl) {
@@ -657,8 +668,4 @@ export async function GET(request, { params }) {
       connectionId: connection.id,
       models
     });
-  } catch (error) {
-    console.log("Error fetching provider models:", error);
-    return NextResponse.json({ error: "Failed to fetch models" }, { status: 500 });
-  }
 }

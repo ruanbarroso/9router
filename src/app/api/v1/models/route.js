@@ -18,6 +18,7 @@ import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { toProxyOptions } from "@/lib/network/proxyOptions";
+import { withCatalogEgress } from "@/lib/network/catalogEgress";
 import { capabilitiesFromServiceKind, getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
 
 // Per-provider live model resolvers. Each receives a connection record and
@@ -381,7 +382,7 @@ export async function buildModelsList(kindFilter, options = {}) {
         : providerModels.map((model) => model.id);
 
       if (isCompatibleProvider && rawModelIds.length === 0 && !skipDynamicFetch) {
-        rawModelIds = await fetchCompatibleModelIds(conn);
+        rawModelIds = await withCatalogEgress(conn, () => fetchCompatibleModelIds(conn));
       }
 
       // Config-driven live catalog override (e.g. Kiro returns dynamic
@@ -390,7 +391,11 @@ export async function buildModelsList(kindFilter, options = {}) {
       const liveResolver = LIVE_MODEL_RESOLVERS[providerId];
       if (liveResolver && !hasExplicitEnabledModels) {
         try {
-          const live = await liveResolver(conn);
+          // Same pool as this connection's chat traffic, and it covers the
+          // token refresh a resolver may trigger on the way. `grok-cli` passes
+          // an explicit bag as well; an explicit argument wins over the store,
+          // so the two agree rather than compete.
+          const live = await withCatalogEgress(conn, () => liveResolver(conn));
           if (live?.models?.length) {
             rawModelIds = live.models.map((m) => m.id);
             liveModelKindById = new Map(

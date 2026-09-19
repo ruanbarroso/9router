@@ -252,8 +252,11 @@ export async function resolveKiroModels(credentials, options = {}) {
   try {
     raw = await fetchKiroCatalogRaw(credentials, options.signal);
   } catch (err) {
-    if (err && err.status === 401 && credentials.refreshToken) {
-      options.log?.info?.("KIRO_MODELS", "Got 401 from Kiro; refreshing token");
+    // 403, not just 401: AWS `ListAvailableModels` answers 403 for an expired
+    // token, so testing 401 alone skipped the refresh and fell through to the
+    // static catalog without a word about why.
+    if (err && (err.status === 401 || err.status === 403) && credentials.refreshToken) {
+      options.log?.info?.("KIRO_MODELS", `Got ${err.status} from Kiro; refreshing token`);
       const refreshed = await refreshKiroToken(
         credentials.refreshToken,
         credentials.providerSpecificData,
