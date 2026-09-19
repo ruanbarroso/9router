@@ -38,7 +38,7 @@ export const PROVIDER_ALIASES = {
   "cloudflare-ai": "cloudflare-workers-ai",
 };
 
-let state = { running: false, lastSync: null, lastError: null, lastResult: null, etag: null, fileVersion: null };
+let state = { running: false, lastSync: null, lastError: null, lastResult: null, etag: null, fileVersion: null, blockedByPolicy: false };
 let timer = null;
 
 export function getSyncState() {
@@ -228,6 +228,13 @@ export async function syncModelCatalog() {
     return result;
   } catch (error) {
     state.lastError = error?.message || String(error);
+    // A refusal by egress policy is not a transient error: it holds until the
+    // configuration changes, so retrying every 30 minutes only prints the same
+    // line forever. models.dev belongs to no connection and so has no pool to
+    // borrow; on a proxy-required host this sync simply cannot run, and the
+    // module already treats a missing catalog as fine — the hand-written
+    // capability tables keep deciding on their own.
+    if (error?.code === "EGRESS_DIRECT_BLOCKED") state.blockedByPolicy = true;
     console.log(`[modelCatalog] sync failed: ${state.lastError}`);
     return null;
   } finally {
@@ -260,6 +267,17 @@ export function startModelCatalogSync() {
   const schedule = (delay) => {
     timer = setTimeout(async () => {
       const result = await syncModelCatalog();
+      if (state.blockedByPolicy) {
+        // Said once, naming the setting that would change the answer, instead
+        // of a refusal line every half hour that reads like a live incident.
+        timer = null;
+        console.log(
+          "[modelCatalog] sync disabled: egress policy refuses models.dev and no pool covers it. " +
+          "Capabilities fall back to the built-in tables. Set MODEL_CATALOG_SYNC=off to silence this, " +
+          "or allow the host under NINEROUTER_REQUIRE_PROXY to re-enable syncing."
+        );
+        return;
+      }
       schedule(result ? SYNC_INTERVAL_MS : RETRY_DELAY_MS);
     }, delay);
     timer.unref?.();
