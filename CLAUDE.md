@@ -34,16 +34,37 @@ cd cli && npm run dev  # nodemon watch
 Tests (vitest, in `tests/`, an **independent** ESM package — not wired into root `npm test`):
 ```bash
 npm install                             # ROOT deps first — tests import from src/ which needs `open`, `undici`, etc.
-cd tests && npm install                 # then tests' own deps (vitest) → tests/node_modules (allowed by tests/.gitignore)
-npx vitest run                          # all tests; auto-discovers tests/vitest.config.js
-npx vitest run unit/capabilities.test.js   # single file (path relative to tests/)
+cd tests && npm install && cd ..        # then tests' own deps (vitest) → tests/node_modules (allowed by tests/.gitignore)
+
+# Run from the REPO ROOT, not from tests/ (see below):
+CI=true ./tests/node_modules/.bin/vitest run --config tests/vitest.config.js
+CI=true ./tests/node_modules/.bin/vitest run --config tests/vitest.config.js tests/unit/capabilities.test.js
 ```
-> The committed `tests/package.json` `test` script hardcodes Unix paths (`NODE_PATH=/tmp/node_modules …`) — a shared-install workaround from upstream. On Windows (or anywhere), ignore it and use the `npx vitest` form above; `vitest.config.js` resolves the `open-sse`/`@/` aliases from the repo root regardless of where vitest lives.
+> **Run from the repo root, and with `CI=true`.** Both matter, and getting either
+> wrong silently changes the result:
+> - `security-audit.test.js` and `db-concurrent.test.js` read sources via
+>   `path.resolve("src/…")`, which is **cwd-relative**. Running from `tests/` makes
+>   them look for `tests/src/…` and 17 tests fail with `ENOENT`.
+> - Without `CI=true`, vitest **writes** missing/stale snapshots instead of failing.
+>   `translator/golden-url-header.test.js` has no committed `.snap` at all, so a
+>   non-CI run silently generates 124 goldens from whatever the code currently does
+>   and reports them as passing.
+> The committed `tests/package.json` `test` script hardcodes Unix paths (`NODE_PATH=/tmp/node_modules …`) — a shared-install workaround from upstream. Ignore it and use the form above; `vitest.config.js` resolves the `open-sse`/`@/` aliases from the repo root regardless of where vitest lives.
 >
-> **The suite is NOT expected to be all-green on a plain checkout.** ~938 pass, ~64 fail. Judge regressions with `tests/__baseline__/verify-no-regression.mjs`, not a raw run. Expected red:
-> - 26 catalogued in `tests/__baseline__/known-fails.txt` (rtk, oauth-cursor-auto-import, translator-request-normalization, …).
-> - `unit/embeddings.cloud.test.js` imports `cloud/src/handlers/embeddings.js` — the `cloud/` worker dir is **not in this repo**, so it always fails here.
-> - `unit/xai-oauth-service.test.js` times out (5s) when the xAI endpoint-discovery fetch isn't reachable/mocked.
+> **The suite is NOT expected to be all-green on a plain checkout.** Measured on
+> upstream `a8c9d380` (v0.5.81): **2230 pass, 232 fail, 59 skipped**. Judge
+> regressions with the gate, never a raw run:
+> ```bash
+> CI=true ./tests/node_modules/.bin/vitest run --config tests/vitest.config.js \
+>   --reporter=json --outputFile=tests/current.json
+> node tests/__baseline__/verify-no-regression.mjs tests/current.json
+> ```
+> The gate reads **every** `tests/__baseline__/known-fails*.txt`. Add a new dated
+> file rather than rewriting the originals — regenerating one list in place is how
+> a real regression gets laundered in. Expected red, by cause:
+> - **124** — `translator/golden-url-header.test.js`: its `.snap` is not committed upstream.
+> - **35** — `unit/cursor-agent-proto.test.js`: tests a Cursor AgentService (`encodeAgentValue`, `encodeMcpTools`, `isAgentCapableRequest`, `buildAgentRunFrame`) that isn't in this version's `cursorProtobuf.js`/`executors/cursor.js`.
+> - **73** — spread over 28 files; 14 of them are the still-valid part of the original `known-fails.txt` (the other 10 rtk entries now pass).
 > - `real/*.real.test.js` make live provider calls — need credentials, skip otherwise.
 - `*.real.test.js` under `tests/translator/real/` make live provider calls — skip unless credentials are set.
 - Regression baselines: `tests/__baseline__/verify-*.mjs` compare against committed snapshots (providers, aliases, OAuth URLs). Run these after touching provider registry / alias logic.
