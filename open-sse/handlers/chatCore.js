@@ -326,6 +326,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
     connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
     vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
+    // Carried through providerSpecificData by the app-side credential resolver.
+    // Built inline rather than with src/lib/network/proxyOptions.js: open-sse/ is
+    // the provider-agnostic engine and must not import from src/.
+    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
   };
 
   if (proxyOptions.vercelRelayUrl) {

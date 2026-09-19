@@ -5,6 +5,7 @@
  */
 
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { toProxyOptions } from "@/lib/network/proxyOptions";
 import { getAntigravityUsage } from "open-sse/services/usage/google.js";
 import * as log from "../utils/logger.js";
 
@@ -105,13 +106,7 @@ export async function refreshAntigravityQuota(connectionId, accessToken, provide
 async function _doRefresh(connectionId, accessToken, providerSpecificData, now) {
   try {
     const proxyCfg = await resolveConnectionProxyConfig(providerSpecificData || {});
-    const proxyOptions = {
-      connectionProxyEnabled: proxyCfg.connectionProxyEnabled === true,
-      connectionProxyUrl: proxyCfg.connectionProxyUrl || "",
-      connectionNoProxy: proxyCfg.connectionNoProxy || "",
-      vercelRelayUrl: proxyCfg.vercelRelayUrl || "",
-      strictProxy: proxyCfg.strictProxy === true,
-    };
+    const proxyOptions = toProxyOptions(proxyCfg);
 
     const usage = await getAntigravityUsage(accessToken, providerSpecificData, proxyOptions);
     // 401/403 usage responses can contain an empty quotas object plus message.

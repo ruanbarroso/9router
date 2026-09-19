@@ -1,5 +1,9 @@
 import { getProxyPoolById } from "@/models";
 
+// The counterpart that turns a config resolved here into the options bag
+// `proxyAwareFetch` expects is `toProxyOptions` in ./proxyOptions.js. It is a
+// separate leaf module deliberately — see the comment there before moving it.
+
 // Safely normalize any value into a trimmed string.
 function normalizeString(value) {
   if (value === undefined || value === null) return "";

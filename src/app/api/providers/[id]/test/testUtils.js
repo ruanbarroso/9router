@@ -1,5 +1,6 @@
 import { getProviderConnectionById, updateProviderConnection } from "@/lib/localDb";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { toProxyOptions } from "@/lib/network/proxyOptions";
 import { testProxyUrl } from "@/lib/network/proxyTest";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 import { getDefaultModel } from "open-sse/config/providerModels.js";
@@ -455,9 +456,7 @@ async function fetchWithConnectionProxy(url, options = {}, effectiveProxy = null
   // Vercel relay: forward via relay URL
   if (effectiveProxy?.vercelRelayUrl) {
     const { proxyAwareFetch } = await import("open-sse/utils/proxyFetch.js");
-    return proxyAwareFetch(url, options, {
-      vercelRelayUrl: effectiveProxy.vercelRelayUrl,
-    });
+    return proxyAwareFetch(url, options, toProxyOptions(effectiveProxy));
   }
 
   if (!effectiveProxy?.connectionProxyEnabled || !effectiveProxy?.connectionProxyUrl) {
@@ -465,11 +464,10 @@ async function fetchWithConnectionProxy(url, options = {}, effectiveProxy = null
   }
 
   const { proxyAwareFetch } = await import("open-sse/utils/proxyFetch.js");
-  return proxyAwareFetch(url, options, {
-    connectionProxyEnabled: true,
-    connectionProxyUrl: effectiveProxy.connectionProxyUrl,
-    connectionNoProxy: effectiveProxy.connectionNoProxy || "",
-  });
+  // Honour the pool's strictProxy here too. "Test connection" reporting success
+  // over a direct fallback is the most misleading result this endpoint can give:
+  // it green-lights an account that the firewall will block in production.
+  return proxyAwareFetch(url, options, toProxyOptions(effectiveProxy));
 }
 
 async function testApiKeyConnection(connection, effectiveProxy = null) {
