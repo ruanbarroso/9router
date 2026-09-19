@@ -32,6 +32,7 @@
 // model spec); set `search` from vendor docs (Claude 4.x+, GPT-5.x/4o, Gemini
 // 2.0+, Grok, Perplexity). Verify with: curl -s https://models.dev/api.json
 
+import { stripThinkingSuffix } from "./modelKey.js";
 import { matchPattern } from "./pricing.js";
 import { looksLikeVisionModel } from "./visionPatterns.js";
 
@@ -534,8 +535,14 @@ function isCommandCodeTextOnly(model) {
   }
   return false;
 }
-export function getCapabilitiesForModel(provider, model) {
-  if (!model) return { ...DEFAULT_CAPABILITIES };
+export function getCapabilitiesForModel(provider, rawModel) {
+  if (!rawModel) return { ...DEFAULT_CAPABILITIES };
+
+  // The reasoning level rides along in the id as a trailing "(level)". It says
+  // nothing about what the model can do, and leaving it on makes every exact
+  // lookup below miss its own entry and fall through to a glob written for a
+  // different model. Strip it once, here, before anything reads the id.
+  const model = stripThinkingSuffix(rawModel);
 
   // Canonical exact lookup strips vendor prefix: "anthropic/claude-opus-4.7" -> "claude-opus-4.7".
   const baseModel = model.includes("/") ? model.split("/").pop() : model;

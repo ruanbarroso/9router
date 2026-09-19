@@ -5,6 +5,8 @@
 //   2. MODEL_PRICING[model]               — canonical model price (provider-agnostic)
 //   3. PATTERN_PRICING                    — glob pattern match (e.g. "codex-*")
 
+import { stripThinkingSuffix } from "./modelKey.js";
+
 /**
  * Canonical model pricing — provider-agnostic.
  * Cover all known models; deduplicated across providers.
@@ -370,8 +372,14 @@ export function matchPattern(pattern, model) {
  * @param {string} model
  * @returns {object|null}
  */
-export function getPricingForModel(provider, model) {
-  if (!model) return null;
+export function getPricingForModel(provider, rawModel) {
+  if (!rawModel) return null;
+
+  // The trailing "(level)" is a reasoning hint, not part of the model's name,
+  // and it does not change the rate. Left on, it misses the exact entries below
+  // and lands on a glob for another model — for gemini-3.8-flash that is a 3×
+  // undercount on every request. Strip it before any lookup.
+  const model = stripThinkingSuffix(rawModel);
 
   // 1. Provider-specific override
   if (provider && PROVIDER_PRICING[provider]?.[model]) {
