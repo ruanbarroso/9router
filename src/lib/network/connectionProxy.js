@@ -185,7 +185,12 @@ export async function resolveConnectionProxyConfig(
       connectionProxyUrl: "",
       connectionNoProxy: "",
 
-      strictProxy: false,
+      // Fail CLOSED. If the pool lookup threw we do not know whether this
+      // connection was supposed to egress through a proxy, and answering
+      // "no proxy, go direct" to that question is the quietest way to leak the
+      // host's real IP: a transient DB error silently downgrades every request
+      // that follows it, with nothing in the logs tying the two together.
+      strictProxy: true,
     };
   }
 }

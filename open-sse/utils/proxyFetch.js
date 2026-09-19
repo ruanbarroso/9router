@@ -1,6 +1,13 @@
 import { Readable } from "stream";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
+import { assertDirectEgressAllowed, isUpstreamHeadersTimeout } from "./egressPolicy.js";
+
+// Proxy authentication failed: the proxy itself rejected us, so this is a proxy
+// fault even though it arrives as a response rather than an exception. 502/503
+// are deliberately NOT in here — those come from the upstream through a working
+// proxy, and combo fallback (services/combo.js) depends on seeing them.
+const PROXY_AUTH_REQUIRED = 407;
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
@@ -190,6 +197,13 @@ function normalizeProxyUrl(proxyUrl) {
   const normalizedInput = normalizeString(proxyUrl);
   if (!normalizedInput) return null;
 
+  // undici's ProxyAgent speaks HTTP CONNECT only. A socks5:// URL would be
+  // accepted here and then fail deep inside the dispatcher with an unrelated
+  // message; say so at the edge instead. No pool in this deployment is SOCKS.
+  if (/^socks\d?:/i.test(normalizedInput)) {
+    throw new Error(`[ProxyFetch] SOCKS proxies are not supported: ${normalizedInput.split("@").pop()}`);
+  }
+
   try {
 
     new URL(normalizedInput);
@@ -291,12 +305,31 @@ async function createBypassRequest(parsedUrl, realIP, options) {
   });
 }
 
+/**
+ * A 407 from the proxy means the proxy refused us — the request never reached
+ * the upstream. Under strictProxy that must fail rather than be handed back as
+ * if it were the model's answer. Every other status, including 502/503, is
+ * returned untouched: those are upstream verdicts relayed by a working proxy,
+ * and combo fallback reads them.
+ */
+function assertProxyResponse(response, proxyOptions) {
+  if (response?.status === PROXY_AUTH_REQUIRED && proxyOptions?.strictProxy === true) {
+    throw new Error("[ProxyFetch] Proxy required but failed (strictProxy=true): proxy returned 407 Proxy Authentication Required");
+  }
+  return response;
+}
+
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
 
   // Vercel relay: forward request via relay headers
   const vercelRelayUrl = normalizeString(proxyOptions?.vercelRelayUrl);
   if (vercelRelayUrl) {
+    // Exit 1 of 4. The relay short-circuit returns before every other check, so
+    // it is the one hole a proxy-required policy would otherwise never see. The
+    // URL to vet is the relay's own, not the target's: the relay is what this
+    // process actually connects to.
+    assertDirectEgressAllowed(vercelRelayUrl, "vercel-relay");
     const parsed = new URL(targetUrl);
     const relayHeaders = {
       ...options.headers,
@@ -316,20 +349,25 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
       try {
         const dispatcher = await getDispatcher(proxyUrl);
-        return await originalFetch(url, { ...options, dispatcher });
+        return await assertProxyResponse(await originalFetch(url, { ...options, dispatcher }), proxyOptions);
       } catch (proxyError) {
+        if (isUpstreamHeadersTimeout(proxyError)) throw proxyError;
         if (proxyOptions?.strictProxy === true) {
           throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
         }
         console.warn(`[ProxyFetch] Proxy failed, falling back to direct bypass: ${proxyError.message}`);
       }
     }
-    // No proxy — manually resolve real IP to bypass DNS spoof
+    // No proxy — manually resolve real IP to bypass DNS spoof.
+    // Exit 2 of 4, and the least obvious: createBypassRequest opens a raw TCP
+    // socket, so it escapes anything that only guards fetch().
     try {
+      assertDirectEgressAllowed(targetUrl, "mitm-dns-bypass");
       const parsedUrl = new URL(targetUrl);
       const realIP = await resolveRealIP(parsedUrl.hostname);
       if (realIP) return await createBypassRequest(parsedUrl, realIP, options);
     } catch (error) {
+      if (error?.code === "EGRESS_DIRECT_BLOCKED") throw error;
       console.warn(`[ProxyFetch] MITM bypass failed: ${error.message}`);
     }
   }
@@ -337,17 +375,24 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   if (proxyUrl) {
     try {
       const dispatcher = await getDispatcher(proxyUrl);
-      return await originalFetch(url, { ...options, dispatcher });
+      return await assertProxyResponse(await originalFetch(url, { ...options, dispatcher }), proxyOptions);
     } catch (proxyError) {
+      // A slow upstream reached through a working proxy is not a proxy fault.
+      // Reporting it as one sends whoever reads the log to the wrong system.
+      if (isUpstreamHeadersTimeout(proxyError)) throw proxyError;
       // If strictProxy is enabled, fail hard instead of falling back to direct
       if (proxyOptions?.strictProxy === true) {
         throw new Error(`[ProxyFetch] Proxy required but failed (strictProxy=true): ${proxyError.message}`);
       }
       console.warn(`[ProxyFetch] Proxy failed, falling back to direct: ${proxyError.message}`);
+      // Exit 3 of 4: the non-strict fallback.
+      assertDirectEgressAllowed(targetUrl, "proxy-failure-fallback");
       return originalFetch(url, options);
     }
   }
 
+  // Exit 4 of 4: no proxy was configured for this request at all.
+  assertDirectEgressAllowed(targetUrl, "no-proxy-configured");
   // got-scraping disabled — use native fetch directly
   // (Re-enable per-host by wrapping with tryGotScrapingFetch when needed)
   return originalFetch(url, options);
