@@ -332,9 +332,13 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       }
 
       // Check if should fallback to next model
-      const { shouldFallback, cooldownMs } = checkFallbackError(result.status, errorText);
+      const { shouldFallback, cooldownMs, advanceCombo } = checkFallbackError(result.status, errorText);
 
-      if (!shouldFallback) {
+      // shouldFallback:false means "do not fan out across this provider's other
+      // accounts". It does NOT mean "give up on the combo": the next step is a
+      // different provider entirely. A rule that knows the error is provider-wide
+      // policy rather than a bad request sets advanceCombo to say so.
+      if (!shouldFallback && !advanceCombo) {
         log.warn("COMBO", `Model ${modelStr} failed (no fallback)`, { status: result.status });
         return result;
       }

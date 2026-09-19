@@ -18,7 +18,7 @@ export function getQuotaCooldown(backoffLevel = 0) {
  * @param {number} status - HTTP status code
  * @param {string} errorText - Error message text
  * @param {number} backoffLevel - Current backoff level for exponential backoff
- * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number }}
+ * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number, advanceCombo?: boolean }}
  */
 export function checkFallbackError(status, errorText, backoffLevel = 0) {
   const lowerError = errorText
@@ -32,7 +32,11 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
         return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
       }
-      return { shouldFallback: true, cooldownMs: rule.cooldownMs };
+      return {
+        shouldFallback: rule.shouldFallback ?? true,
+        cooldownMs: rule.cooldownMs,
+        advanceCombo: rule.advanceCombo ?? false,
+      };
     }
 
     // Status-based rule: match HTTP status code
@@ -41,7 +45,11 @@ export function checkFallbackError(status, errorText, backoffLevel = 0) {
         const newLevel = Math.min(backoffLevel + 1, BACKOFF_CONFIG.maxLevel);
         return { shouldFallback: true, cooldownMs: getQuotaCooldown(newLevel), newBackoffLevel: newLevel };
       }
-      return { shouldFallback: true, cooldownMs: rule.cooldownMs };
+      return {
+        shouldFallback: rule.shouldFallback ?? true,
+        cooldownMs: rule.cooldownMs,
+        advanceCombo: rule.advanceCombo ?? false,
+      };
     }
   }
 

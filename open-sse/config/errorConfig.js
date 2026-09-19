@@ -50,14 +50,29 @@ const COOLDOWN = {
 /**
  * Unified error classification rules.
  * Checked top-to-bottom: text rules first (by order), then status rules.
- * Each rule: { text?, status?, cooldownMs?, backoff? }
+ * Each rule: { text?, status?, cooldownMs?, backoff?, shouldFallback?, advanceCombo? }
  *   - text: substring match (case-insensitive) on error message
  *   - status: HTTP status code match
  *   - cooldownMs: fixed cooldown duration
  *   - backoff: true = use exponential backoff (rate limit)
+ *   - shouldFallback: false = do NOT try the other accounts of this provider
+ *   - advanceCombo: true = still try the NEXT MODEL of the combo
+ *
+ * shouldFallback and advanceCombo are separate on purpose. They answer two
+ * different questions and a single boolean conflates them: "don't fan out across
+ * this provider's accounts" is not "don't try the other models of the combo".
  */
 export const ERROR_RULES = [
   // --- Text-based rules (checked first, order = priority) ---
+
+  // OpenCode Zen free tier: deterministic product policy, identical for every
+  // account (measured: 12/12 accounts, 0 successes). Fanning out burns all 12 in
+  // ~3s for nothing, so no account fallback and no cooldown — the credential is
+  // healthy. But the combo MUST advance: the next model is a different provider
+  // and has no reason to fail.
+  { text: "free tier can only be used from within opencode", shouldFallback: false, advanceCombo: true, cooldownMs: 0 },
+  { text: "freetiererror",                                   shouldFallback: false, advanceCombo: true, cooldownMs: 0 },
+
   { text: "no credentials",           cooldownMs: COOLDOWN.long },
   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
   { text: "improperly formed request", cooldownMs: COOLDOWN.long },
