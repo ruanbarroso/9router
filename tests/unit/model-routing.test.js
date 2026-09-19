@@ -16,7 +16,18 @@ async function setupDb() {
   return {
     createProviderNode,
     getModelInfo,
-    cleanup() {
+    async cleanup() {
+      // Fechar o handle do SQLite antes do rmSync: no Windows apagar um
+      // arquivo com handle aberto dá EPERM e derruba o arquivo de teste.
+      try {
+        const { getAdapter } = await import("@/lib/db/driver.js");
+        (await getAdapter())?.close?.();
+      } catch { /* teardown não deve mascarar falha de teste */ }
+      // O adapter vive em `global._dbAdapter` (driver.js:4) justamente para
+      // sobreviver ao hot-reload — e sobrevive também ao `vi.resetModules()`.
+      // Sem zerar o cache aqui, o teste seguinte reusa o handle que acabamos
+      // de fechar e estoura com "database is not open".
+      global._dbAdapter = { instance: null, initPromise: null, logged: false };
       fs.rmSync(tempDir, { recursive: true, force: true });
     },
   };
@@ -29,10 +40,10 @@ describe("model routing", () => {
     vi.clearAllMocks();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.resetModules();
     vi.clearAllMocks();
-    cleanup();
+    await cleanup();
     cleanup = () => {};
     if (originalDataDir === undefined) delete process.env.DATA_DIR;
     else process.env.DATA_DIR = originalDataDir;

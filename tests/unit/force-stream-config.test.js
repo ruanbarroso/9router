@@ -71,6 +71,11 @@ vi.mock("../../open-sse/rtk/index.js", () => ({
 vi.mock("../../open-sse/rtk/headroom.js", () => ({
   compressWithHeadroom: vi.fn(async () => null),
   formatHeadroomLog: vi.fn(() => ""),
+  // O mock precisa cobrir TODA a superficie que chatCore importa, senao o
+  // modulo mockado nao tem o simbolo e a chamada estoura. `chatCore.js:273`
+  // chama formatHeadroomSizeLog (headroom.js:353), que faltava aqui.
+  formatHeadroomSizeLog: vi.fn(() => ""),
+  isHeadroomPhantomSavings: vi.fn(() => false),
 }));
 
 vi.mock("../../open-sse/providers/capabilities.js", () => ({

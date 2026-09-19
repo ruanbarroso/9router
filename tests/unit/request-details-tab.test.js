@@ -22,13 +22,18 @@ beforeAll(async () => {
   vi.resetModules();
   db = await import("@/lib/db/index.js");
   await db.initDb();
-  await db.updateSettings({ enableObservability2: true, observabilityBatchSize: 1 });
+  await db.updateSettings({ enableObservability: true, observabilityBatchSize: 1 });
 
   const { getAdapter } = await import("@/lib/db/driver.js");
   adapter = await getAdapter();
 });
 
 afterAll(() => {
+  // Fechar o handle do SQLite ANTES do rmSync. No Windows um arquivo com
+  // handle aberto não pode ser apagado: o rmSync dava EPERM e derrubava o
+  // arquivo de teste inteiro no teardown, mesmo com os 25 testes passando.
+  // Todos os adapters expõem close() (src/lib/db/adapters/*.js).
+  try { adapter?.close?.(); } catch { /* teardown não deve mascarar falha de teste */ }
   if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
   if (originalDataDir === undefined) delete process.env.DATA_DIR;
   else process.env.DATA_DIR = originalDataDir;
