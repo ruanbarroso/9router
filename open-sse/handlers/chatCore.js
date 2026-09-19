@@ -100,6 +100,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
   const upstreamModel = getModelUpstreamId(alias, model);
+  // The trailing "(level)" is thinking intent, not part of the model's name. It
+  // is consumed below by applyThinking and already stripped from the body — but
+  // executors also receive the id to build the upstream URL and headers, and the
+  // gemini format puts it straight in the path (`…/{model}:generateContent`).
+  // A suffix that survives to there comes back as
+  // `GenerateContentRequest.model: unexpected model name`.
+  const executorModel = stripThinkingSuffix(model);
 
   // Inject provider-level thinking config override (only if client hasn't set)
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
@@ -365,7 +372,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   let providerResponseFormat = targetFormat;
   try {
     const result = await executor.execute({
-      model,
+      model: executorModel,
       body: translatedBody,
       stream,
       credentials,
@@ -429,7 +436,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         }
         try {
           const retryResult = await executor.execute({
-            model,
+            model: executorModel,
             body: translatedBody,
             stream,
             credentials,
