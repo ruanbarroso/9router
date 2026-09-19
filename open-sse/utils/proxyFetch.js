@@ -3,6 +3,7 @@ import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
 import { assertDirectEgressAllowed, isUpstreamHeadersTimeout } from "./egressPolicy.js";
 import { getAmbientProxyOptions } from "./egressContext.js";
+import { resolveRealIP } from "./dnsBypass.js";
 
 // Proxy authentication failed: the proxy itself rejected us, so this is a proxy
 // fault even though it arrives as a response rather than an exception. 502/503
@@ -105,8 +106,6 @@ async function tryGotScrapingFetch(url, options) {
 }
 */
 
-// DNS cache — use Map to avoid prototype pollution via malformed hostnames
-const DNS_CACHE = new Map();
 const MITM_BYPASS_HOSTS = [
   "cloudcode-pa.googleapis.com",
   "daily-cloudcode-pa.googleapis.com",
@@ -115,7 +114,6 @@ const MITM_BYPASS_HOSTS = [
   "codewhisperer.us-east-1.amazonaws.com",
   "api2.cursor.sh",
 ];
-const GOOGLE_DNS_SERVERS = ["8.8.8.8", "8.8.4.4"];
 const HTTPS_PORT = 443;
 const HTTP_SUCCESS_MIN = 200;
 const HTTP_SUCCESS_MAX = 300;
@@ -123,28 +121,6 @@ const HTTP_SUCCESS_MAX = 300;
 function normalizeString(value) {
   if (value === undefined || value === null) return "";
   return String(value).trim();
-}
-
-/**
- * Resolve real IP using Google DNS (bypass system DNS)
- */
-async function resolveRealIP(hostname) {
-  const cached = DNS_CACHE.get(hostname);
-  if (cached && Date.now() < cached.expiry) return cached.ip;
-
-  try {
-    const dns = await import("dns");
-    const { promisify } = await import("util");
-    const resolver = new dns.Resolver();
-    resolver.setServers(GOOGLE_DNS_SERVERS);
-    const resolve4 = promisify(resolver.resolve4.bind(resolver));
-    const addresses = await resolve4(hostname);
-    DNS_CACHE.set(hostname, { ip: addresses[0], expiry: Date.now() + MEMORY_CONFIG.dnsCacheTtlMs });
-    return addresses[0];
-  } catch (error) {
-    console.warn(`[ProxyFetch] DNS resolve failed for ${hostname}:`, error.message);
-    return null;
-  }
 }
 
 /**
@@ -365,7 +341,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     try {
       assertDirectEgressAllowed(targetUrl, "mitm-dns-bypass");
       const parsedUrl = new URL(targetUrl);
-      const realIP = await resolveRealIP(parsedUrl.hostname);
+      const realIP = await resolveRealIP(parsedUrl.hostname, { ttlMs: MEMORY_CONFIG.dnsCacheTtlMs });
       if (realIP) return await createBypassRequest(parsedUrl, realIP, options);
     } catch (error) {
       if (error?.code === "EGRESS_DIRECT_BLOCKED") throw error;

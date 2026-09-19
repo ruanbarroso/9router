@@ -10,6 +10,18 @@
 //   6. register-session failure is distinguishable (backend contract)
 //   8. (backend) reopen/re-register creates a fresh session
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// This file binds real TCP ports and drives a real loopback OAuth round trip.
+// It takes ~7.5s on its own, already past vitest's 5s default, so it was racing
+// the clock under the full suite's concurrency. The work is the same work; only
+// the wall clock it is allowed changes.
+//
+// This is not a cure for the other flake seen here: under load these tests also
+// fail intermittently with `fetch failed` on their own loopback port, which is
+// a connection-level race, not a timeout. That one predates this change and
+// reproduces with it reverted — it is left alone rather than papered over,
+// because a gate that hides a real pass→fail is worse than one that is noisy.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 import crypto from "node:crypto";
 import {
   createZedNativeAuthData,

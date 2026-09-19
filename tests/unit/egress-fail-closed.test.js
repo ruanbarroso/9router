@@ -218,3 +218,164 @@ describe("proxyAwareFetch — the four direct-egress exits", () => {
     expect(err.message).not.toContain("hunter2");
   });
 });
+
+describe("DNS for the MITM bypass", () => {
+  let getDnsServers;
+  let isLoopbackAddress;
+  let resolveRealIP;
+  let clearDnsCache;
+
+  beforeEach(async () => {
+    ({ getDnsServers, isLoopbackAddress, resolveRealIP, clearDnsCache } =
+      await import("../../open-sse/utils/dnsBypass.js"));
+    clearDnsCache();
+  });
+
+  // A fake `node:dns` with the same two shapes the module uses: `dns.promises`
+  // for the system resolver, and `dns.promises.Resolver` for a named one.
+  const fakeDns = (answers) => {
+    const calls = [];
+    const lookup = (server) => async (hostname) => {
+      calls.push(server);
+      const a = answers[server];
+      if (a instanceof Error) throw a;
+      if (!a) throw new Error("ENOTFOUND");
+      return a;
+    };
+    return {
+      calls,
+      dns: {
+        promises: {
+          resolve4: lookup("system"),
+          Resolver: class {
+            setServers([s]) { this.server = s; }
+            resolve4(h) { return lookup(this.server)(h); }
+          },
+        },
+      },
+    };
+  };
+
+  describe("getDnsServers", () => {
+    it("defaults to public resolvers with the system one last", () => {
+      // Last, not absent: on a normal host it is the right answer, and on a
+      // fail-closed one it is the only resolver that is reachable at all.
+      expect(getDnsServers({})).toEqual(["8.8.8.8", "8.8.4.4", "system"]);
+    });
+
+    it("takes an ordered list from NINEROUTER_DNS_SERVERS", () => {
+      expect(getDnsServers({ NINEROUTER_DNS_SERVERS: "10.0.0.53, 10.0.0.54" }))
+        .toEqual(["10.0.0.53", "10.0.0.54", "system"]);
+    });
+
+    it("appends the system resolver when the operator's list omits it", () => {
+      // A list naming only unreachable servers is a worse failure than one
+      // extra attempt.
+      expect(getDnsServers({ NINEROUTER_DNS_SERVERS: "10.0.0.53" })).toContain("system");
+    });
+
+    it("keeps the operator's position for the system resolver", () => {
+      expect(getDnsServers({ NINEROUTER_DNS_SERVERS: "system, 10.0.0.53" }))
+        .toEqual(["system", "10.0.0.53"]);
+    });
+
+    it("still honours the deprecated KROUTER_ name", () => {
+      expect(getDnsServers({ KROUTER_DNS_SERVERS: "10.0.0.53" }))
+        .toEqual(["10.0.0.53", "system"]);
+    });
+
+    it("ignores a blank value and falls back to the defaults", () => {
+      expect(getDnsServers({ NINEROUTER_DNS_SERVERS: "  ,  " })).toEqual(["8.8.8.8", "8.8.4.4", "system"]);
+    });
+  });
+
+  describe("isLoopbackAddress", () => {
+    it.each(["127.0.0.1", "127.1.2.3", "::1", "", null])("refuses %s", (ip) => {
+      expect(isLoopbackAddress(ip)).toBe(true);
+    });
+
+    it.each(["52.10.1.4", "100.64.0.5"])("accepts %s", (ip) => {
+      expect(isLoopbackAddress(ip)).toBe(false);
+    });
+  });
+
+  describe("resolveRealIP", () => {
+    const opts = (dns, env = {}) => ({ dns, env, log: { warn: () => {} } });
+
+    it("returns the first real answer", async () => {
+      const { dns, calls } = fakeDns({ "8.8.8.8": ["52.10.1.4"] });
+      expect(await resolveRealIP("q.us-east-1.amazonaws.com", opts(dns))).toBe("52.10.1.4");
+      expect(calls).toEqual(["8.8.8.8"]);
+    });
+
+    it("falls through to the next server when one is unreachable", async () => {
+      // This is the fail-closed host: 8.8.8.8:53 is REJECT, and the internal
+      // resolver is the only one that answers.
+      const { dns, calls } = fakeDns({
+        "8.8.8.8": new Error("EREFUSED"),
+        "10.0.0.53": ["52.10.1.4"],
+      });
+      const ip = await resolveRealIP("q.us-east-1.amazonaws.com",
+        opts(dns, { NINEROUTER_DNS_SERVERS: "8.8.8.8,10.0.0.53" }));
+      expect(ip).toBe("52.10.1.4");
+      expect(calls).toEqual(["8.8.8.8", "10.0.0.53"]);
+    });
+
+    it("refuses a loopback answer and tries the next server", async () => {
+      // The subtle one. A stub resolver synthesises /etc/hosts, so it hands
+      // back exactly the 127.0.0.1 this bypass exists to route around — and
+      // the bypass would then dial the MITM on purpose, over a raw socket no
+      // proxy setting can redirect.
+      const { dns, calls } = fakeDns({
+        "10.0.0.53": ["127.0.0.1"],
+        "8.8.8.8": ["52.10.1.4"],
+      });
+      const ip = await resolveRealIP("q.us-east-1.amazonaws.com",
+        opts(dns, { NINEROUTER_DNS_SERVERS: "10.0.0.53,8.8.8.8" }));
+      expect(ip).toBe("52.10.1.4");
+      expect(calls).toEqual(["10.0.0.53", "8.8.8.8"]);
+    });
+
+    it("picks the real address out of a mixed answer", async () => {
+      const { dns } = fakeDns({ "8.8.8.8": ["127.0.0.1", "52.10.1.4"] });
+      expect(await resolveRealIP("q.us-east-1.amazonaws.com", opts(dns))).toBe("52.10.1.4");
+    });
+
+    it("returns null when every server refuses or lies", async () => {
+      // Null, not a throw: the caller falls back to ordinary proxied fetch,
+      // which is the right outcome for a workaround that did not apply.
+      const { dns } = fakeDns({ "10.0.0.53": ["127.0.0.1"], system: new Error("EREFUSED") });
+      const ip = await resolveRealIP("q.us-east-1.amazonaws.com",
+        opts(dns, { NINEROUTER_DNS_SERVERS: "10.0.0.53" }));
+      expect(ip).toBe(null);
+    });
+
+    it("names every attempt in the warning", async () => {
+      // Otherwise a fail-closed host reports a bare `fetch failed` with
+      // nothing pointing at DNS as the step that broke.
+      const { dns } = fakeDns({ "10.0.0.53": ["127.0.0.1"], system: new Error("EREFUSED") });
+      const warn = vi.fn();
+      await resolveRealIP("q.us-east-1.amazonaws.com", {
+        dns, env: { NINEROUTER_DNS_SERVERS: "10.0.0.53" }, log: { warn },
+      });
+      const msg = warn.mock.calls[0][0];
+      expect(msg).toContain("10.0.0.53: loopback answer refused");
+      expect(msg).toContain("system: EREFUSED");
+    });
+
+    it("caches a real answer and does not ask again", async () => {
+      const { dns, calls } = fakeDns({ "8.8.8.8": ["52.10.1.4"] });
+      await resolveRealIP("cached.example.com", opts(dns));
+      await resolveRealIP("cached.example.com", opts(dns));
+      expect(calls).toEqual(["8.8.8.8"]);
+    });
+
+    it("never caches a refused loopback answer", async () => {
+      // Caching the spoof would pin the MITM for the whole TTL.
+      const { dns, calls } = fakeDns({ "8.8.8.8": ["127.0.0.1"] });
+      await resolveRealIP("spoofed.example.com", opts(dns));
+      await resolveRealIP("spoofed.example.com", opts(dns));
+      expect(calls.filter((c) => c === "8.8.8.8")).toHaveLength(2);
+    });
+  });
+});
