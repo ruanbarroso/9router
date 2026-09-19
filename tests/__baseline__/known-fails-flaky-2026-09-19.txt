@@ -1,0 +1,54 @@
+# Falhas NÃO-DETERMINÍSTICAS observadas em `master` limpo (a8c9d380, v0.5.81).
+#
+# Estas entradas NÃO são known-fails estruturais como as de known-fails-v0.5.81.txt.
+# São testes que passam ou falham conforme a carga da máquina. Estão num arquivo
+# separado justamente para que ninguém as confunda com o baseline real.
+#
+# Como foram levantadas
+# ---------------------
+# A medição original do baseline (232 falhas) foi UMA amostra, e por isso estava
+# errada: quatro rodadas completas da suíte deram 232, 234, 234, 235 e 236
+# falhas. O delta é exatamente a lista abaixo. Contagem de aparições em 4
+# rodadas completas, todas com `CI=true` a partir da raiz do repo:
+#
+#   4/4  xai-oauth-service :: generates dashboard auth data ...
+#   4/4  xai-oauth-service :: exchanges dashboard codes ...
+#   2/4  db-concurrent     :: mixed concurrent: usage + details + connections + aliases
+#   1/4  usage-dispatch    :: unsupported provider -> not-implemented message
+#
+# Causa
+# -----
+# Três delas são TIMEOUT, não falha de asserção. Durações medidas contra o
+# `testTimeout` padrão do vitest (5000 ms, não sobrescrito em vitest.config.js):
+#
+#   5027 ms  xai-oauth-service :: generates dashboard auth data ...
+#   5016 ms  xai-oauth-service :: exchanges dashboard codes ...
+#   5046 ms  usage-dispatch    :: unsupported provider -> not-implemented message
+#
+# Os três fazem `await import(...)` de uma cadeia pesada dentro do corpo do teste
+# (`src/lib/oauth/providers.js` reexporta toda a árvore de providers de OAuth).
+# Com `maxConcurrency: 60` a suíte satura a máquina e o import estoura o limite.
+# Rodados isoladamente, passam: os dois de xai levam ~200-2500 ms.
+#
+#   CI=true ./tests/node_modules/.bin/vitest run --config tests/vitest.config.js \
+#     tests/unit/xai-oauth-service.test.js
+#
+# A quarta (db-concurrent, 137 ms) é uma corrida real de escrita concorrente em
+# SQLite; o arquivo já tem duas irmãs no baseline estrutural.
+#
+# O que isto custa
+# ----------------
+# Enquanto estiverem aqui, o portão NÃO detecta regressão real nestes quatro
+# testes. É uma troca consciente: sem elas o portão fica vermelho em toda
+# execução e deixa de valer para qualquer coisa. Se algum for tocado por uma
+# mudança de código, verifique-o à mão, isolado, pelo comando acima.
+#
+# Conserto de verdade (fora do escopo desta migração): subir o `testTimeout`
+# desses três ou tirar o import dinâmico do corpo do teste. Não fiz aqui porque
+# alterar tempo de teste durante uma migração esconde exatamente o tipo de
+# lentidão que a migração poderia introduzir.
+
+tests/unit/xai-oauth-service.test.js :: xai/oauth service generates dashboard auth data with CLIProxyAPI PKCE size and discovered endpoints
+tests/unit/xai-oauth-service.test.js :: xai/oauth service exchanges dashboard codes against the discovered xAI token endpoint
+tests/unit/db-concurrent.test.js :: DB Concurrency — atomic safety mixed concurrent: usage + details + connections + aliases
+tests/unit/usage-dispatch.test.js :: usage dispatch unsupported provider → not-implemented message
