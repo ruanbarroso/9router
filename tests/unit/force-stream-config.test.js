@@ -147,6 +147,14 @@ describe("forceStream provider config", () => {
     }
   });
 
+  // Mesma causa do xai-oauth-service: o `await import` do chatCore puxa um grafo
+  // grande e, com a suíte inteira rodando em paralelo, a PRIMEIRA das duas
+  // instâncias do it.each estourava os 5000ms padrão. O segundo caso então
+  // falhava em cascata com "expected 1 times, but got 2 times" — a chamada da
+  // instância que deu timeout ainda estava em voo e pousava no executeMock
+  // DEPOIS do mockReset do beforeEach, somando-se à do caso seguinte. O
+  // "2 times" era consequência do timeout, nunca um bug de contagem: com o
+  // orçamento de tempo correto, o contador volta a 1 sozinho.
   it.each([undefined, false])( "keeps forced-stream providers streaming for JSON clients when body.stream is %s", async (bodyStream) => {
     const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
 
@@ -154,5 +162,5 @@ describe("forceStream provider config", () => {
 
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(executeMock.mock.calls[0][0].stream).toBe(true);
-  });
+  }, 30000);
 });

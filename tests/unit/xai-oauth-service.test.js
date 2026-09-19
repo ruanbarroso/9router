@@ -1,5 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// Os dois testes que importam `src/lib/oauth/providers.js` (o barril de 24
+// arquivos, não o `services/xai.js` enxuto dos três primeiros) estouravam os
+// 5000ms PADRÃO do vitest — mas só na suíte inteira, nunca isolados. Não é
+// flakiness nem estado vazado: o `vi.resetModules()` do beforeEach descarta o
+// cache de módulos, então CADA teste paga a resolução do grafo inteiro do zero,
+// medido aqui em ~3.4s com a máquina sob carga paralela total (~1.2s ociosa).
+// Some o resto do corpo do teste e passa dos 5s. O timeout do arquivo é o
+// conserto certo: o orçamento é que estava errado, não o código.
+//
+// O sintoma no reporter JSON era `Error: STACK_TRACE_ERROR`, que esconde a
+// mensagem real — o texto "Test timed out in 5000ms" só aparece no reporter
+// default. Vale lembrar disso antes de caçar causa em cima do JSON.
+const SLOW_IMPORT_MS = 30000;
+
 describe("xai/oauth service", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -82,7 +96,7 @@ describe("xai/oauth service", () => {
     expect(parsed.searchParams.get("code_challenge_method")).toBe("S256");
     expect(parsed.searchParams.get("plan")).toBe("generic");
     expect(parsed.searchParams.get("referrer")).toBe("cli-proxy-api");
-  });
+  }, SLOW_IMPORT_MS);
 
   it("exchanges dashboard codes against the discovered xAI token endpoint", async () => {
     const fetchMock = fetch;
@@ -121,5 +135,5 @@ describe("xai/oauth service", () => {
       refreshToken: "refresh-token",
       expiresIn: 3600,
     });
-  });
+  }, SLOW_IMPORT_MS);
 });
