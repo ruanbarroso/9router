@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
+import { normalizeComboEntries } from "open-sse/services/comboEntry.js";
 
 function rowToCombo(row) {
   if (!row) return null;
@@ -8,7 +9,12 @@ function rowToCombo(row) {
     id: row.id,
     name: row.name,
     kind: row.kind,
-    models: parseJson(row.models, []),
+    // The stored column holds both shapes — strings from older writes, objects
+    // from the dashboard and the CLI. Normalising on read is the migration:
+    // idempotent, observable, and reversible by reverting this line, where a
+    // migration that rewrote the column would not be. Rows already written as
+    // strings come back as the very same array.
+    models: normalizeComboEntries(parseJson(row.models, [])),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

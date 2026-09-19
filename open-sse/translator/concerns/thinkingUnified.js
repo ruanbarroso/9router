@@ -23,11 +23,11 @@ const FORMAT_TO_NATIVE = {
 };
 
 // Strip a trailing thinking suffix "model(value)" → "model" (no-op when absent).
-export function stripThinkingSuffix(model) {
-  if (typeof model !== "string") return model;
-  const m = model.match(/^(.*)\([^()]+\)\s*$/);
-  return m ? m[1].trim() : model;
-}
+// Re-exported rather than redefined: `providers/modelKey.js` is the leaf copy
+// the capability and pricing tables can reach without an import cycle, and two
+// definitions of where a model name ends is exactly the kind of thing that
+// drifts apart quietly.
+export { stripThinkingSuffix } from "../../providers/modelKey.js";
 
 // Parse model-name suffix "model(value)" → { cleanModel, override }.
 // value: level name (high) | number (8192) | auto | none. null override when absent.

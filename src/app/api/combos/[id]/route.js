@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getComboById, updateCombo, deleteCombo, getComboByName } from "@/lib/localDb";
 import { resetComboRotation } from "open-sse/services/combo.js";
+import { normalizeComboEntriesStrict } from "open-sse/services/comboEntry.js";
 
 // Validate combo name: only a-z, A-Z, 0-9, -, _
 const VALID_NAME_REGEX = /^[a-zA-Z0-9_.\-]+$/;
@@ -41,9 +42,29 @@ export async function PUT(request, { params }) {
       }
     }
     
+    // A PUT without `models` is a rename or a strategy change; leave the column
+    // alone rather than normalising an absent field into an empty list.
+    let patch = body;
+    if (body.models !== undefined) {
+      // Not an array is a malformed request, not an instruction to clear the
+      // list — answering it with a silent wipe is the failure mode this whole
+      // change exists to stop.
+      if (!Array.isArray(body.models)) {
+        return NextResponse.json({ error: "models must be an array" }, { status: 400 });
+      }
+      const { models, dropped } = normalizeComboEntriesStrict(body.models);
+      if (dropped.length) {
+        return NextResponse.json(
+          { error: `${dropped.length} model entr${dropped.length === 1 ? "y names" : "ies name"} no model` },
+          { status: 400 },
+        );
+      }
+      patch = { ...body, models };
+    }
+
     // Capture previous name to invalidate rotation state on rename
     const prev = await getComboById(id);
-    const combo = await updateCombo(id, body);
+    const combo = await updateCombo(id, patch);
     
     if (!combo) {
       return NextResponse.json({ error: "Combo not found" }, { status: 404 });

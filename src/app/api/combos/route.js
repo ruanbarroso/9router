@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getCombos, createCombo, getComboByName } from "@/lib/localDb";
+import { normalizeComboEntriesStrict } from "open-sse/services/comboEntry.js";
 
 export const dynamic = "force-dynamic";
 
@@ -38,7 +39,21 @@ export async function POST(request) {
       return NextResponse.json({ error: "Combo name already exists" }, { status: 400 });
     }
 
-    const combo = await createCombo({ name, models: models || [], kind: kind || null });
+    // Store the one shape the router can dispatch. Refusing an entry that names
+    // no model is the point: storing the rest of the list silently is how a
+    // combo quietly loses a model on an edit round trip.
+    if (models !== undefined && !Array.isArray(models)) {
+      return NextResponse.json({ error: "models must be an array" }, { status: 400 });
+    }
+    const { models: normalizedModels, dropped } = normalizeComboEntriesStrict(models || []);
+    if (dropped.length) {
+      return NextResponse.json(
+        { error: `${dropped.length} model entr${dropped.length === 1 ? "y names" : "ies name"} no model` },
+        { status: 400 },
+      );
+    }
+
+    const combo = await createCombo({ name, models: normalizedModels, kind: kind || null });
 
     return NextResponse.json(combo, { status: 201 });
   } catch (error) {
