@@ -70,9 +70,18 @@ export default function ProviderDetailPage() {
   const [thinkingMode, setThinkingMode] = useState("auto");
   const [autoPing, setAutoPing] = useState({ enabled: false, connections: {} });
   const [suggestedModels, setSuggestedModels] = useState([]);
-  const [liveModels, setLiveModels] = useState([]);
-  // Live-catalog fetch warning/error (surfaced for zed only; cursor behavior unchanged).
-  const [liveModelsError, setLiveModelsError] = useState(null);
+  // Live catalog (cursor, zed) is stored together with the key it was fetched
+  // for, so switching provider or connection invalidates it by derivation. The
+  // effect below therefore only ever writes state asynchronously, on arrival.
+  const [liveCatalog, setLiveCatalog] = useState({ key: null, models: [], error: null });
+  const liveCatalogConnectionId = (providerId === "cursor" || providerId === "zed")
+    ? connections.find((item) => item.isActive !== false)?.id || null
+    : null;
+  const liveCatalogKey = liveCatalogConnectionId ? `${providerId}:${liveCatalogConnectionId}` : null;
+  const liveCatalogCurrent = liveCatalogKey && liveCatalog.key === liveCatalogKey;
+  const liveModels = liveCatalogCurrent ? liveCatalog.models : [];
+  // Fetch warning/error, surfaced for zed only; cursor behavior unchanged.
+  const liveModelsError = liveCatalogCurrent ? liveCatalog.error : null;
   const [kiloFreeModels, setKiloFreeModels] = useState([]);
   const [disabledModelIds, setDisabledModelIds] = useState([]);
   const [confirmState, setConfirmState] = useState(null);
@@ -120,6 +129,10 @@ export default function ProviderDetailPage() {
   };
 
   const triggerAddConnection = () => {
+    // A no-auth provider has no OAuth flow to start and POST /api/providers
+    // rejects it, so neither modal applies — the buttons are hidden and this
+    // guard keeps any other caller from opening the wrong one.
+    if (isFreeNoAuth) return;
     if (isOAuth) {
       triggerOAuthConnection();
       return;
@@ -463,6 +476,9 @@ export default function ProviderDetailPage() {
   };
 
   useEffect(() => {
+    // False positive: all four are async and only setState after an await, so
+    // nothing here writes state synchronously during the effect body.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchConnections();
     fetchAliases();
     fetchCustomModels();
@@ -474,44 +490,28 @@ export default function ProviderDetailPage() {
   // the provider id or connection list changes — no polling, no loop.
   // Cursor path is statement-identical to before; zed adds error surfacing.
   useEffect(() => {
-    const isLiveCatalog = providerId === "cursor" || providerId === "zed";
-    if (!isLiveCatalog) {
-      setLiveModels([]);
-      return;
-    }
-
-    const connection = connections.find((item) => item.isActive !== false);
-    if (!connection?.id) {
-      setLiveModels([]);
-      if (providerId === "zed") setLiveModelsError(null);
-      return;
-    }
+    if (!liveCatalogKey || !liveCatalogConnectionId) return;
 
     let cancelled = false;
-    if (providerId === "zed") setLiveModelsError(null);
-    fetch(`/api/providers/${connection.id}/models`, { cache: "no-store" })
+    const isZed = providerId === "zed";
+    const store = (models, error) => {
+      if (!cancelled) setLiveCatalog({ key: liveCatalogKey, models, error });
+    };
+    fetch(`/api/providers/${liveCatalogConnectionId}/models`, { cache: "no-store" })
       .then(async (res) => ({ ok: res.ok, data: await res.json().catch(() => null) }))
       .then(({ ok, data }) => {
-        if (cancelled) return;
         if (ok && Array.isArray(data?.models) && data.models.length > 0) {
-          setLiveModels(data.models);
-          if (providerId === "zed" && data?.warning) setLiveModelsError(data.warning);
+          store(data.models, isZed && data?.warning ? data.warning : null);
           return;
         }
-        if (providerId === "zed") {
-          setLiveModels([]);
-          setLiveModelsError(data?.warning || data?.error || "Zed returned no live models.");
-        }
+        if (isZed) store([], data?.warning || data?.error || "Zed returned no live models.");
       })
       .catch(() => {
-        if (!cancelled && providerId === "zed") {
-          setLiveModels([]);
-          setLiveModelsError("Failed to reach the Zed model catalog.");
-        }
+        if (isZed) store([], "Failed to reach the Zed model catalog.");
       });
 
     return () => { cancelled = true; };
-  }, [providerId, connections]);
+  }, [providerId, liveCatalogKey, liveCatalogConnectionId]);
 
   // Fetch suggested models from provider's public API (if configured)
   useEffect(() => {
@@ -796,7 +796,7 @@ export default function ProviderDetailPage() {
   };
 
   const handleBulkDelete = () => {
-    const count = selectedConnectionIds.length;
+    const count = activeSelectedIds.length;
     if (count === 0) return;
     setConfirmState({
       title: `Delete ${count} Connection${count > 1 ? "s" : ""}`,
@@ -804,7 +804,7 @@ export default function ProviderDetailPage() {
       onConfirm: async () => {
         setConfirmState(null);
         let failed = 0;
-        const idsToDelete = [...selectedConnectionIds];
+        const idsToDelete = [...activeSelectedIds];
         for (const id of idsToDelete) {
           try {
             const res = await fetch(`/api/providers/${id}`, { method: "DELETE" });
@@ -916,8 +916,12 @@ export default function ProviderDetailPage() {
     }
   };
 
+  // Selection is pruned by derivation, not by an effect that writes state back:
+  // ids whose connection has since been deleted simply stop appearing here, so
+  // counts and the delete payload can never name a row that is gone.
   const selectedConnections = connections.filter((conn) => selectedConnectionIds.includes(conn.id));
-  const allSelected = connections.length > 0 && selectedConnectionIds.length === connections.length;
+  const activeSelectedIds = selectedConnections.map((conn) => conn.id);
+  const allSelected = connections.length > 0 && activeSelectedIds.length === connections.length;
 
   const toggleSelectConnection = (connectionId) => {
     setSelectedConnectionIds((prev) => (
@@ -939,10 +943,6 @@ export default function ProviderDetailPage() {
     setSelectedConnectionIds([]);
     setBulkProxyPoolId("__none__");
   };
-
-  useEffect(() => {
-    setSelectedConnectionIds((prev) => prev.filter((id) => connections.some((conn) => conn.id === id)));
-  }, [connections]);
 
   const selectedProxySummary = (() => {
     if (selectedConnections.length === 0) return "";
@@ -1505,7 +1505,11 @@ export default function ProviderDetailPage() {
       )}
 
       {/* Connections */}
-      {isFreeNoAuth ? (
+      {/* A no-auth provider only falls back to the single public-egress card when
+          the install has no rows of its own. Once accounts are persisted (one
+          OpenCode row per proxy), they are what the runtime selects from, so the
+          normal Connections card must list them and keep the per-row proxy picker. */}
+      {isFreeNoAuth && connections.length === 0 ? (
         <NoAuthProxyCard providerId={providerId} />
       ) : (
         <Card>
@@ -1524,14 +1528,14 @@ export default function ProviderDetailPage() {
               )}
               {connections.length > 0 && (
                 <>
-                  {selectedConnectionIds.length > 0 && (
+                  {activeSelectedIds.length > 0 && (
                     <Button
                       size="sm"
                       variant="danger"
                       icon="delete"
                       onClick={handleBulkDelete}
                     >
-                      Delete Selected ({selectedConnectionIds.length})
+                      Delete Selected ({activeSelectedIds.length})
                     </Button>
                   )}
                   <Button
@@ -1665,7 +1669,7 @@ export default function ProviderDetailPage() {
                 </div>
               )}
               {connectionsList}
-              {!isCompatible && (
+              {!isCompatible && !isFreeNoAuth && (
                 <div className="mt-4 grid grid-cols-1 gap-2 sm:flex">
                   {providerId === "iflow" && (
                     <Button

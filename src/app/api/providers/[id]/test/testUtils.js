@@ -857,7 +857,11 @@ export async function testSingleConnection(id) {
   const start = Date.now();
   let result;
 
-  if (connection.authType === "apikey" || connection.authType === "cookie") {
+  // authType "none" = a persisted row of a no-auth free provider (OpenCode). It has
+  // no token to refresh, so the OAuth branch would only report "not supported";
+  // the per-provider switch inside testApiKeyConnection has its public probe and
+  // uses this row's own resolved proxy.
+  if (connection.authType === "apikey" || connection.authType === "cookie" || connection.authType === "none") {
     result = await testApiKeyConnection(connection, effectiveProxy);
   } else {
     result = await testOAuthConnection(connection, effectiveProxy);

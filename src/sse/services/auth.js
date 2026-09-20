@@ -43,8 +43,16 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Resolve alias to provider ID (e.g., "kc" -> "kilocode")
     const providerId = resolveProviderId(provider);
 
-    // Inject a virtual connection for no-auth free providers (with optional proxy pool from settings)
-    if (FREE_PROVIDERS[providerId]?.noAuth) {
+    const connections = await getProviderConnections({ provider: providerId, isActive: true });
+
+    // No-auth free providers fall back to a virtual public connection ONLY when the
+    // install has no active rows of its own. Once accounts are persisted (e.g. the
+    // OpenCode pool of one row per egress proxy), they must go through the normal
+    // selection path below: that is what gives each request a real connectionId —
+    // which the OpenCode executor turns into a per-account upstream session — plus
+    // the row's own proxy pool, per-model locks and account fallback. The public
+    // `Bearer` credential the executor sends upstream is unchanged either way.
+    if (FREE_PROVIDERS[providerId]?.noAuth && connections.length === 0) {
       const settings = await getSettings();
       const override = (settings.providerStrategies || {})[providerId] || {};
       const strategy = override.rotateStrategy || "none";
@@ -68,7 +76,6 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       };
     }
 
-    const connections = await getProviderConnections({ provider: providerId, isActive: true });
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
