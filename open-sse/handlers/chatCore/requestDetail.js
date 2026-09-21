@@ -100,7 +100,22 @@ export function formatDoneLine({ usage, latency }) {
   return `DONE ${latency?.total ?? 0}ms${ttftStr} · ${inStr} · OUT ${outTok}`;
 }
 
-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE", silent = false }) {
+// Latency is the only per-request signal that never reaches the usage table:
+// the journal has it but not the virtual key, and requestDetails has both only
+// while ENABLE_REQUEST_LOGS is on (and it evicts at maxRecords). Carrying it here
+// makes "how slow is key X?" answerable from usageHistory alone.
+function normalizeLatency(latency) {
+  if (!latency || typeof latency !== "object") return undefined;
+  const total = Number.isFinite(latency.total) ? Math.round(latency.total) : undefined;
+  const ttft = Number.isFinite(latency.ttft) ? Math.round(latency.ttft) : undefined;
+  if (total === undefined && ttft === undefined) return undefined;
+  const out = {};
+  if (total !== undefined) out.total = total;
+  if (ttft !== undefined) out.ttft = ttft;
+  return out;
+}
+
+export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, latency, label = "USAGE", silent = false }) {
   if (!tokens || typeof tokens !== "object") return;
 
   const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
@@ -128,6 +143,7 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     timestamp: new Date().toISOString(),
     connectionId: connectionId || undefined,
     apiKey: apiKey || undefined,
-    endpoint: endpoint || null
+    endpoint: endpoint || null,
+    latency: normalizeLatency(latency)
   }).catch(() => {});
 }

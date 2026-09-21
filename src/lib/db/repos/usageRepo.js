@@ -238,6 +238,18 @@ export async function getActiveRequests() {
   return { activeRequests, recentRequests, errorProvider };
 }
 
+// meta was always written as an empty object, so usageHistory could say WHICH key
+// made a request but never how long it took. Keep it a JSON blob (no migration) and
+// only put in what the caller actually measured.
+function buildMeta(entry) {
+  const meta = {};
+  if (entry.latency && typeof entry.latency === "object") {
+    if (Number.isFinite(entry.latency.total)) meta.latencyMs = Math.round(entry.latency.total);
+    if (Number.isFinite(entry.latency.ttft)) meta.ttftMs = Math.round(entry.latency.ttft);
+  }
+  return meta;
+}
+
 export async function saveRequestUsage(entry) {
   try {
     const db = await getAdapter();
@@ -284,7 +296,7 @@ export async function saveRequestUsage(entry) {
           entry.timestamp, entry.provider || null, entry.model || null,
           entry.connectionId || null, entry.apiKey || null, entry.endpoint || null,
           promptTokens, completionTokens, entry.cost || 0, entry.status || "ok",
-          stringifyJson(tokens), stringifyJson({}),
+          stringifyJson(tokens), stringifyJson(buildMeta(entry)),
         ]
       );
 
