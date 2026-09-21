@@ -4,12 +4,75 @@
 
 import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
+import { TetoDeDegrau } from "./stepCeiling.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
 const HARD_CAPS = new Set(["vision", "pdf", "audioInput", "videoInput"]);
+
+// Memória viva dos tempos de degrau, por (provider, model). Fica no módulo
+// porque o teto é uma propriedade da DUPLA, não de uma requisição: quem aprende
+// com as 1.769 chamadas do `gemini-3.5-flash-lite` é a dupla, e a requisição
+// seguinte é quem colhe. Ver `stepCeiling.js` para a conta e os freios.
+const tetoDeDegrau = new TetoDeDegrau();
+
+export function _tetoDeDegrauParaTeste() {
+  return tetoDeDegrau;
+}
+
+// Sentinela de corte. Um símbolo, e não um `null`/`throw`, porque o degrau pode
+// legitimamente resolver com qualquer Response e pode legitimamente lançar: só um
+// valor que ninguém mais produz distingue "o teto cortou" de "o provider falhou".
+const CORTADO = Symbol("degrau cortado pelo teto");
+
+/**
+ * Resolve com `CORTADO` se `promessa` não terminar em `ms`.
+ *
+ * A promessa abandonada continua correndo — não há como cancelá-la daqui, porque
+ * o `AbortController` que comandaria a conexão vive dentro do `chatCore` e não é
+ * exposto ao combo. O que NÃO se pode fazer é largá-la sem dono: uma Response
+ * cujo corpo nunca é lido segura o socket até o timeout do provider, e uma
+ * rejeição sem handler derruba o processo com `unhandledRejection`. Por isso as
+ * duas pontas são tratadas aqui — o corpo é cancelado quando (e se) chegar.
+ */
+function comTeto(promessa, ms) {
+  let timer = null;
+  const corte = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(CORTADO), ms);
+  });
+
+  const adotada = promessa.then(
+    (valor) => {
+      clearTimeout(timer);
+      return valor;
+    },
+    (erro) => {
+      clearTimeout(timer);
+      throw erro;
+    }
+  );
+
+  return Promise.race([adotada, corte]).then((vencedor) => {
+    if (vencedor === CORTADO) {
+      // Perdeu a corrida: ninguém mais vai ler esta resposta. Solta o socket e
+      // engole o erro, que a partir daqui não tem a quem ser reportado.
+      adotada
+        .then((r) => r?.body?.cancel?.().catch?.(() => {}))
+        .catch(() => {});
+    }
+    return vencedor;
+  });
+}
+
+// Separa "provider/model" — o nome do degrau que o combo usa — nas duas partes
+// que indexam a série. Um degrau sem "/" não é endereçável e não aprende.
+function parDoDegrau(modelStr) {
+  const i = modelStr.indexOf("/");
+  if (i <= 0) return null;
+  return { provider: modelStr.slice(0, i), model: modelStr.slice(i + 1) };
+}
 
 // Prefixes used when flattening tool turns into plain prose for panel models.
 const TOOL_CALL_PREFIX = "[Called tools: ";
@@ -301,9 +364,31 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     const modelStr = rotatedModels[i];
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
+    // O teto só vale quando há PARA ONDE cair. Cortar o último degrau não troca
+    // uma espera por uma alternativa — troca uma espera por um erro, que é
+    // estritamente pior para quem chamou. Ver freio 3 em `stepCeiling.js`.
+    const temSaidaDaqui = i + 1 < rotatedModels.length;
+    const par = parDoDegrau(modelStr);
+    const tetoMs = temSaidaDaqui && par ? tetoDeDegrau.tetoPara(par.provider, par.model) : null;
+    const degrauT0 = Date.now();
+
     try {
-      const result = await handleSingleModel(body, modelStr);
-      
+      const result = tetoMs
+        ? await comTeto(handleSingleModel(body, modelStr), tetoMs)
+        : await handleSingleModel(body, modelStr);
+
+      if (result === CORTADO) {
+        // Amostra NÃO plena: um degrau que o próprio teto cortou não volta para
+        // a série, senão o teto aprende com o que ele mesmo truncou. Ver o bloco
+        // AMOSTRA em `stepCeiling.js`.
+        log.warn("COMBO", `Model ${modelStr} excedeu o teto de ${tetoMs}ms, indo para o próximo`);
+        lastError = `step ceiling ${tetoMs}ms exceeded`;
+        if (!lastStatus) lastStatus = 504;
+        continue;
+      }
+
+      if (par) tetoDeDegrau.registrarPlena(par.provider, par.model, Date.now() - degrauT0);
+
       // Success (2xx) - return response
       if (result.ok) {
         log.info("COMBO", `Model ${modelStr} succeeded`);
