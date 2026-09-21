@@ -2,7 +2,12 @@
 const isNode = typeof process !== "undefined" && process.versions?.node && typeof window === "undefined";
 
 // Check if logging is enabled via environment variable (default: false)
-const LOGGING_ENABLED = typeof process !== "undefined" && process.env?.ENABLE_REQUEST_LOGS === 'true';
+// ENABLE_REQUEST_LOGS turns on the DB-backed observability used by the dashboard
+// (requestDetails + usageHistory.meta). It must NOT also turn on this file dumper:
+// the dumps below write request/response bodies AND, because maskSensitiveHeaders is
+// currently a pass-through, verbatim Authorization headers to disk. That is a
+// credential and prompt spill, so it gets its own opt-in and stays off by default.
+const LOGGING_ENABLED = typeof process !== "undefined" && process.env?.ENABLE_REQUEST_FILE_DUMPS === 'true';
 
 let fs = null;
 let path = null;
@@ -69,25 +74,47 @@ function writeJsonFile(sessionPath, filename, data) {
   }
 }
 
-// Mask sensitive data in headers (DISABLED - keep full token for testing)
+// Mask sensitive data in headers.
+// These dumps land on disk as plain files, so anything not masked here is a
+// credential at rest. Masking keeps a recognizable prefix/suffix (enough to tell
+// two tokens apart when debugging) and drops the middle. Short values are replaced
+// outright rather than partially shown: revealing 20 chars of a 24-char key is
+// not redaction.
+const SENSITIVE_HEADER_KEYS = [
+  "authorization",
+  "x-api-key",
+  "api-key",
+  "cookie",
+  "set-cookie",
+  "token",
+  "secret",
+  "x-goog-api-key",
+  "x-auth",
+  "proxy-authorization",
+];
+
+function maskHeaderValue(value) {
+  const str = Array.isArray(value) ? value.join(", ") : String(value ?? "");
+  if (!str) return str;
+  if (str.length <= 20) return "[REDACTED]";
+  return `${str.slice(0, 6)}…[REDACTED]…${str.slice(-4)}`;
+}
+
 function maskSensitiveHeaders(headers) {
   if (!headers) return {};
-  return { ...headers };
-  
-  // Old masking code (disabled):
-  // const masked = { ...headers };
-  // const sensitiveKeys = ["authorization", "x-api-key", "cookie", "token"];
-  // 
-  // for (const key of Object.keys(masked)) {
-  //   const lowerKey = key.toLowerCase();
-  //   if (sensitiveKeys.some(sk => lowerKey.includes(sk))) {
-  //     const value = masked[key];
-  //     if (value && value.length > 20) {
-  //       masked[key] = value.slice(0, 10) + "..." + value.slice(-5);
-  //     }
-  //   }
-  // }
-  // return masked;
+  // Accept a Headers instance as well as a plain object: logProviderResponse
+  // receives whatever the provider handed back.
+  const plain = typeof headers?.entries === "function"
+    ? Object.fromEntries(headers.entries())
+    : { ...headers };
+
+  for (const key of Object.keys(plain)) {
+    const lowerKey = key.toLowerCase();
+    if (SENSITIVE_HEADER_KEYS.some((sk) => lowerKey.includes(sk))) {
+      plain[key] = maskHeaderValue(plain[key]);
+    }
+  }
+  return plain;
 }
 
 // No-op logger when logging is disabled
@@ -170,7 +197,7 @@ export async function createRequestLogger(sourceFormat, targetFormat, model) {
         timestamp: new Date().toISOString(),
         status,
         statusText,
-        headers: headers ? (typeof headers.entries === "function" ? Object.fromEntries(headers.entries()) : headers) : {},
+        headers: maskSensitiveHeaders(headers),
         body
       });
     },
