@@ -71,7 +71,10 @@ async function gateOnFirstByte(upstreamBody, ceilingMs) {
     },
     async pull(controller) {
       try {
-        const { done, value } = pending ? await (() => { const p = pending; pending = null; return p; })() : await reader.read();
+        // Cleared before the await so a second pull() can never await it twice.
+        const inFlight = pending;
+        pending = null;
+        const { done, value } = await (inFlight || reader.read());
         if (done) { controller.close(); return; }
         controller.enqueue(value);
       } catch (e) { controller.error(e); }
