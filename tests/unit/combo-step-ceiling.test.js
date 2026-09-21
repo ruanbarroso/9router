@@ -347,6 +347,51 @@ describe("aprendizado com observações censuradas", () => {
   });
 });
 
+describe("o que entra na série", () => {
+  it("um 429 rápido NÃO vira amostra de entrega rápida", async () => {
+    // O `gemini-3.8-flash(high)` recusa com 429 em ~200 ms, 4.122 vezes contra
+    // 48 entregas na janela medida. Se o erro entrasse como duração, a série
+    // aprenderia "este degrau responde em 200 ms" e passaria a cortá-lo no
+    // piso — exatamente quando ele estivesse disponível para responder.
+    const memoria = _tetoDeDegrauParaTeste();
+    memoria.series.clear();
+
+    await handleComboChat({
+      body: {},
+      models: ["gemini/recusa", "cx/luna"],
+      log,
+      handleSingleModel: async (_b, m) => {
+        if (m === "gemini/recusa") {
+          return new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 });
+        }
+        return ok();
+      },
+    });
+
+    // Nem plena nem censurada: o degrau TERMINOU (recusando), então não é
+    // censura; e não entregou, então não é duração de entrega.
+    expect(memoria.observacoesVivas("gemini", "recusa")).toHaveLength(0);
+    memoria.series.clear();
+  });
+
+  it("só o 2xx entra como amostra plena", async () => {
+    const memoria = _tetoDeDegrauParaTeste();
+    memoria.series.clear();
+
+    await handleComboChat({
+      body: {},
+      models: ["gemini/entrega", "cx/luna"],
+      log,
+      handleSingleModel: async () => ok(),
+    });
+
+    const obs = memoria.observacoesVivas("gemini", "entrega");
+    expect(obs).toHaveLength(1);
+    expect(obs[0].cortada).toBe(false);
+    memoria.series.clear();
+  });
+});
+
 describe("kaplanMeier", () => {
   it("sem censura reproduz a empírica", async () => {
     const { kaplanMeier } = await import("open-sse/services/stepCeiling.js");

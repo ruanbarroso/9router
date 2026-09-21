@@ -486,10 +486,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         continue;
       }
 
-      if (par) tetoDeDegrau.registrarPlena(par.provider, par.model, Date.now() - degrauT0);
-
       // Success (2xx) - return response
       if (result.ok) {
+        // SÓ O 2xx É AMOSTRA DE ENTREGA. Um erro rápido não é uma entrega
+        // rápida: o `gemini-3.8-flash(high)` devolve 429 em ~200 ms (4.122
+        // vezes na janela medida, contra 48 entregas), e registrar isso como
+        // duração ensinaria "este degrau responde em 200 ms" — a série
+        // desceria até o piso e passaria a cortar o degrau justamente quando
+        // ele estivesse disponível para responder de verdade.
+        //
+        // Um erro também NÃO é uma censura: censura é "passou de T sem
+        // terminar", e aqui o degrau terminou — só que recusando. Não é
+        // observação da distribuição de tempo de entrega por nenhum dos dois
+        // lados, então não entra na série de forma alguma.
+        if (par) tetoDeDegrau.registrarPlena(par.provider, par.model, Date.now() - degrauT0);
         log.info("COMBO", `Model ${modelStr} succeeded`);
         return result;
       }
