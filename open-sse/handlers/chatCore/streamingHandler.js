@@ -3,7 +3,8 @@ import { needsTranslation } from "../../translator/index.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS, CLAUDE_FIRST_BYTE_GATE_MS } from "../../config/runtimeConfig.js";
+import { createErrorResult } from "../../utils/error.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
 import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
@@ -42,16 +43,83 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
 }
 
 /**
+ * Wait for the upstream's first chunk before the caller commits HTTP 200.
+ *
+ * Returns one of:
+ *   { outcome: "byte", body }   — a chunk arrived; `body` re-assembles it with
+ *                                 the rest of the upstream, so nothing is lost.
+ *   { outcome: "timeout", body } — the ceiling passed with no byte. NOT a
+ *                                 failure: `body` is the untouched upstream and
+ *                                 the caller proceeds exactly as before.
+ *   { outcome: "empty", message } — upstream ended (EOF or error) without ever
+ *                                 sending a byte. This is the case worth
+ *                                 catching: no 200 has been sent yet, so it can
+ *                                 still become a retry.
+ *
+ * Same peek-before-commit shape as `codex.js` `_peekSseTransientError` and
+ * `qoder.js` `peekFirstQoderFrame`.
+ */
+async function gateOnFirstByte(upstreamBody, ceilingMs) {
+  const reader = upstreamBody.getReader();
+
+  // `pending` is the in-flight first read, if the ceiling won the race. It MUST
+  // be consumed before any further read(): dropping it would silently swallow
+  // the first chunk of a slow-but-healthy response.
+  const rebuild = (prefix, pending = null) => new ReadableStream({
+    start(controller) {
+      for (const c of prefix) controller.enqueue(c);
+    },
+    async pull(controller) {
+      try {
+        const { done, value } = pending ? await (() => { const p = pending; pending = null; return p; })() : await reader.read();
+        if (done) { controller.close(); return; }
+        controller.enqueue(value);
+      } catch (e) { controller.error(e); }
+    },
+    cancel(reason) {
+      try { reader.cancel(reason); } catch { /* noop */ }
+    },
+  });
+
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), ceilingMs);
+  });
+
+  try {
+    const firstRead = reader.read();
+    const race = await Promise.race([firstRead.then((r) => ({ read: r })), timeout]);
+
+    if (race.timedOut) {
+      // The read is still pending and still owns the lock; hand the caller a
+      // stream that consumes that same pending read before continuing.
+      return { outcome: "timeout", body: rebuild([], firstRead) };
+    }
+
+    const { done, value } = race.read;
+    if (done || !value || (value.byteLength ?? value.length ?? 0) === 0) {
+      return { outcome: "empty", message: "upstream closed before first token" };
+    }
+    return { outcome: "byte", body: rebuild([value]) };
+  } catch (e) {
+    return { outcome: "empty", message: `upstream closed before first token: ${e?.message || e}` };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
-export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, pxpipe, reqTag, log, credentials }) {
-  if (onRequestSuccess) {
+export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, settled = { done: false }, pxpipe, reqTag, log, credentials }) {
+  const reportSuccess = () => {
+    if (!onRequestSuccess) return;
     Promise.resolve()
       .then(onRequestSuccess)
       .catch(err => {
         console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
       });
-  }
+  };
 
   // When upstream returns HTML/text instead of SSE (e.g. Cloudflare 5xx error
   // page), piping it through the SSE transform stream causes Next.js
@@ -80,6 +148,37 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     };
   }
 
+  // First-byte gate — Claude passthrough only. A stream that dies before its
+  // first token is the one failure the gateway can still convert into a retry:
+  // no byte has reached the client, so the 200 is not yet committed and
+  // `{ success: false }` sends the request back through the account loop in
+  // src/sse/handlers/chat.js. Scope and ceiling are justified in
+  // CLAUDE_FIRST_BYTE_GATE_MS (claude TTFT p99 = 2,824ms); the rest of the
+  // traffic (codex p50 = 26.7s) could never afford the wait.
+  let upstreamBody = providerResponse.body;
+  const isClaudePassthrough =
+    sourceFormat === FORMATS.CLAUDE &&
+    targetFormat === FORMATS.CLAUDE &&
+    PROVIDERS[provider]?.format === FORMATS.CLAUDE;
+
+  if (isClaudePassthrough && upstreamBody) {
+    const gate = await gateOnFirstByte(upstreamBody, CLAUDE_FIRST_BYTE_GATE_MS);
+    if (gate.outcome === "empty") {
+      const msg = `[${provider}/${model}] ${gate.message}`;
+      if (log?.errorLine) log.errorLine(reqTag, "⇄", `EMPTY STREAM · ${provider}/${model} · ${Date.now() - requestStartTime}ms → NEXT ACCOUNT`);
+      else console.warn(`[STREAM] ${msg}`);
+      streamController?.handleError?.(new Error(gate.message));
+      // 502: upstream accepted then broke. The text rule in errorConfig.js keeps
+      // this from cooling down a credential that did nothing wrong.
+      return createErrorResult(HTTP_STATUS.BAD_GATEWAY, msg);
+    }
+    upstreamBody = gate.body;
+  }
+
+  // Only now is there evidence of a live stream. Moved off the optimistic path:
+  // it used to clear the account's error state before a single byte existed.
+  reportSuccess();
+
   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, customToolNames, model, connectionId, body, onStreamComplete, apiKey, credentials });
 
   // Terminal bytes when the stream aborts after HTTP 200 was already sent, so the
@@ -89,9 +188,38 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
   const onAbortTerminal = isResponsesPassthrough
     ? buildAbortedResponsesTerminalBytes
-    : (message) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat);
+    : (message, opts) => buildStreamErrorBytes(HTTP_STATUS.GATEWAY_TIMEOUT, message, sourceFormat, { ...opts, model });
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
-  const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
+
+  // The abort path never reaches finalizeStream(), so onStreamComplete never
+  // fires and the placeholder row below would stay "success" forever. Rewriting
+  // the SAME id turns that silent row into the error it actually was — the
+  // UPSERT in requestDetailsRepo gives the overwrite for free.
+  const onStreamAborted = (reason, stats) => {
+    if (settled.done) return;
+    settled.done = true;
+    if (log?.errorLine) log.errorLine(reqTag, "✗", `STREAM ABORTED · ${provider}/${model} · ${reason} · chunks=${stats?.chunkCount ?? 0} · ${stats?.durationMs ?? 0}ms`);
+    else console.warn(`[STREAM] ABORTED ${provider}/${model} | ${reason} | chunks=${stats?.chunkCount ?? 0}`);
+
+    saveRequestDetail(buildRequestDetail({
+      provider, model, connectionId, apiKey,
+      endpoint: clientRawRequest?.endpoint,
+      latency: { ttft: 0, total: Date.now() - requestStartTime },
+      tokens: { prompt_tokens: 0, completion_tokens: 0 },
+      request: extractRequestConfig(body, stream),
+      providerRequest: finalBody || translatedBody || null,
+      providerResponse: "[Streaming - aborted before completion]",
+      response: { content: "[Stream aborted]", thinking: null, type: "streaming" },
+      pxpipe,
+      status: "error",
+      statusCode: HTTP_STATUS.GATEWAY_TIMEOUT,
+      errorReason: reason
+    }, { id: streamDetailId })).catch(err => {
+      console.error("[RequestDetail] Failed to record aborted stream:", err.message);
+    });
+  };
+
+  const transformedBody = pipeWithDisconnect({ body: upstreamBody }, transformStream, streamController, onAbortTerminal, stallTimeoutMs, onStreamAborted);
 
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId, apiKey,
@@ -119,8 +247,14 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
  */
 export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, pxpipe, reqTag, log }) {
   const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  // Completion and abort both rewrite the same row. They are near-exclusive, but
+  // a partial EOF can reach flush() -> finalizeStream() and then still error, so
+  // whichever lands first owns the outcome.
+  const settled = { done: false };
 
   const onStreamComplete = (contentObj, usage, ttftAt) => {
+    if (settled.done) return;
+    settled.done = true;
     const latency = {
       ttft: ttftAt ? ttftAt - requestStartTime : Date.now() - requestStartTime,
       total: Date.now() - requestStartTime
@@ -148,5 +282,5 @@ export function buildOnStreamComplete({ provider, model, connectionId, apiKey, r
     if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency }));
   };
 
-  return { onStreamComplete, streamDetailId };
+  return { onStreamComplete, streamDetailId, settled };
 }

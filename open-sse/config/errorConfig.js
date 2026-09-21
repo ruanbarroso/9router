@@ -73,6 +73,13 @@ export const ERROR_RULES = [
   { text: "free tier can only be used from within opencode", shouldFallback: false, advanceCombo: true, cooldownMs: 0 },
   { text: "freetiererror",                                   shouldFallback: false, advanceCombo: true, cooldownMs: 0 },
 
+  // Portão de primeiro byte do passthrough Claude: o upstream aceitou a
+  // requisição, devolveu headers e fechou sem mandar um token. Isso não diz nada
+  // contra a credencial — o default (30 s de TRANSIENT_COOLDOWN_MS) tiraria uma
+  // conta saudável da rotação por uma queda de socket. Troca de conta na hora,
+  // sem cooldown: a próxima tentativa é o que faz o cliente nunca ver a falha.
+  { text: "upstream closed before first token", shouldFallback: true, cooldownMs: 0 },
+
   { text: "no credentials",           cooldownMs: COOLDOWN.long },
   { text: "request not allowed",      cooldownMs: COOLDOWN.short },
   { text: "improperly formed request", cooldownMs: COOLDOWN.long },

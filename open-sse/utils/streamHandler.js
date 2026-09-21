@@ -98,11 +98,25 @@ export function createStreamController({ onDisconnect, onError, log, provider, m
  *
  * @param {function} [onAbortTerminal] - Receives a human-readable abort
  * message and returns terminal SSE bytes to emit downstream.
+ * @param {function} [onStreamAborted] - Receives a human-readable abort reason
+ * when the stream dies after HTTP 200 was already committed. This is the ONLY
+ * signal for that case: `finalizeStream()` (and therefore `onStreamComplete`)
+ * never runs on an abort path, so without this the request row stays frozen on
+ * its "[Streaming in progress...]" placeholder with status "success" while the
+ * client got an empty body.
  */
-export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null) {
+export function createDisconnectAwareStream(transformStream, streamController, onAbortTerminal = null, onStreamAborted = null) {
   const reader = transformStream.readable.getReader();
   const writer = transformStream.writable.getWriter();
   let terminalEmitted = false;
+  let abortReported = false;
+
+  // Report the abort exactly once, whichever path gets there first.
+  const reportAbort = (reason) => {
+    if (abortReported || !onStreamAborted) return;
+    abortReported = true;
+    try { onStreamAborted(reason); } catch { /* observability must never break the stream */ }
+  };
 
   // Emit a synthesized terminal payload (e.g. Responses response.failed + [DONE]) once
   const emitTerminal = (controller) => {
@@ -117,6 +131,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
   return new ReadableStream({
     async pull(controller) {
       if (!streamController.isConnected()) {
+        reportAbort("client disconnected");
         emitTerminal(controller);
         controller.close();
         return;
@@ -132,6 +147,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
         }
         controller.enqueue(value);
       } catch (error) {
+        reportAbort(error?.message || "upstream stream error");
         const wasConnected = streamController.isConnected();
         // Controller already closed = downstream ended; not an upstream error, skip noisy log.
         const msg0 = error?.message || "";
@@ -169,6 +185,7 @@ export function createDisconnectAwareStream(transformStream, streamController, o
     },
 
     cancel(reason) {
+      reportAbort(typeof reason === "string" ? reason : (reason?.message || "cancelled"));
       streamController.handleDisconnect(reason || "cancelled");
       reader.cancel();
       writer.abort();
@@ -192,12 +209,17 @@ export function createDisconnectAwareStream(transformStream, streamController, o
  * @param {TransformStream} transformStream - Transform stream for SSE
  * @param {object} streamController - Stream controller from createStreamController
  */
-export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS) {
+export function pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal = null, stallTimeoutMs = STREAM_STALL_TIMEOUT_MS, onStreamAborted = null) {
   let stallTimer = null;
   let chunkCount = 0;
   let totalBytes = 0;
   let lastChunkAt = Date.now();
   let abortMessage = "upstream connection lost";
+  // Whether the upstream ever emitted the Anthropic protocol opening. The abort
+  // terminal needs it: an `event: error` with no preceding `message_start` is
+  // off-protocol, and the client reports it as a malformed response instead of
+  // a retryable error.
+  let sawOpening = false;
   const t0 = Date.now();
   const tag = "STREAM";
   const clearStall = () => {
@@ -208,7 +230,9 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
     stallTimer = setTimeout(() => {
       stallTimer = null;
       abortMessage = "stream stall timeout";
-      dbg(tag, `STALL TIMEOUT ${stallTimeoutMs}ms | chunks=${chunkCount} | bytes=${totalBytes} | sinceLast=${Date.now() - lastChunkAt}ms`);
+      // Not dbg(): dbg is dev-only, which is why every stall in production was
+      // invisible in the journal.
+      console.warn(`[STREAM] STALL TIMEOUT ${stallTimeoutMs}ms | chunks=${chunkCount} | bytes=${totalBytes} | sinceLast=${Date.now() - lastChunkAt}ms`);
       streamController.handleError?.(new Error("stream stall timeout"));
       streamController.abort?.();
     }, stallTimeoutMs);
@@ -230,6 +254,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   armStall();
   dbg(tag, `pipe start | stallTimeout=${stallTimeoutMs}ms`);
 
+  const decoder = new TextDecoder();
+
   const upstreamTap = new TransformStream({
     transform(chunk, controller) {
       chunkCount++;
@@ -238,6 +264,13 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
       const now = Date.now();
       const gap = now - lastChunkAt;
       lastChunkAt = now;
+      // Only the first few chunks are inspected — the opening event is the first
+      // thing Anthropic sends, so scanning past it would be pure cost.
+      if (!sawOpening && chunkCount <= 3) {
+        try {
+          if (decoder.decode(chunk, { stream: true }).includes("message_start")) sawOpening = true;
+        } catch { /* binary upstream (kiro EventStream): no opening to find */ }
+      }
       if (isDebugEnabled && (chunkCount <= 5 || chunkCount % 20 === 0 || gap > 5000)) {
         dbg(tag, `chunk #${chunkCount} | size=${sz}B | gap=${gap}ms | total=${totalBytes}B`);
       }
@@ -254,7 +287,8 @@ export function pipeWithDisconnect(providerResponse, transformStream, streamCont
   return createDisconnectAwareStream(
     { readable: transformedBody, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
     wrappedController,
-    onAbortTerminal ? () => onAbortTerminal(abortMessage) : null
+    onAbortTerminal ? () => onAbortTerminal(abortMessage, { sawOpening }) : null,
+    onStreamAborted ? (reason) => onStreamAborted(reason, { chunkCount, totalBytes, durationMs: Date.now() - t0 }) : null
   );
 }
 

@@ -136,12 +136,40 @@ export function formatSSE(data, sourceFormat) {
 //
 // NOTE: non-SSE client formats (Ollama NDJSON) get an SSE frame here — dead in
 // practice because detectFormatByEndpoint never resolves to OLLAMA.
-export function buildStreamErrorBytes(statusCode, message, clientFormat) {
+//
+// Claude clients get two extra guarantees, because the point of this frame is
+// that the client RETRIES on its own instead of surfacing a dead 200 to a human:
+//   - `overloaded_error`, not `server_error`. Anthropic clients retry the former
+//     and give up on the latter, and a stream that died before its first token
+//     is exactly the transient case retrying is for.
+//   - a synthetic `message_start` when the upstream never sent one. An `error`
+//     event with no opening is off-protocol; the client reports it as a
+//     malformed response ("empty or malformed response (HTTP 200)") rather than
+//     as the retryable error it is.
+export function buildStreamErrorBytes(statusCode, message, clientFormat, { sawOpening = true, model = null } = {}) {
   const { error } = buildErrorBody(statusCode, message);
 
-  const sse = clientFormat === FORMATS.CLAUDE
-    ? formatSSE({ type: "error", error }, FORMATS.CLAUDE)
-    : formatSSE({ error }, clientFormat) + SSE_DONE;
+  if (clientFormat !== FORMATS.CLAUDE) {
+    return sharedEncoder.encode(formatSSE({ error }, clientFormat) + SSE_DONE);
+  }
+
+  let sse = "";
+  if (!sawOpening) {
+    sse += formatSSE({
+      type: "message_start",
+      message: {
+        id: `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`,
+        type: "message",
+        role: "assistant",
+        model: model || "unknown",
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    }, FORMATS.CLAUDE);
+  }
+  sse += formatSSE({ type: "error", error: { ...error, type: "overloaded_error" } }, FORMATS.CLAUDE);
 
   return sharedEncoder.encode(sse);
 }
