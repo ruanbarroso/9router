@@ -169,3 +169,89 @@ describe("handleComboChat com teto", () => {
     expect(res.status).toBe(200);
   });
 });
+
+// ── Teto CONFIGURADO: o que faltava para a correção valer em produção ────────
+//
+// O teto aprendido exige 40 amostras por dupla. O `barroso-quick` recebe ~22
+// chamadas por hora e a série é em memória: na prática o teto nunca armava, e
+// era justamente na janela sem medição que os 503 de 60 s caíam. Estes testes
+// fixam que o teto de partida vale desde a PRIMEIRA requisição.
+describe("teto configurado (COMBO_STEP_CEILING_MS)", () => {
+  it("corta um degrau pendurado SEM nenhuma amostra aprendida — o caso real de produção", async () => {
+    const memoria = _tetoDeDegrauParaTeste();
+    memoria.series.clear();
+
+    // Prova que a dupla não tem medição nenhuma: é o estado logo após um deploy.
+    expect(memoria.amostrasVivas("gemini", "nova")).toHaveLength(0);
+
+    const vistos = [];
+    let pendurouAteOFim = false;
+    const res = await handleComboChat({
+      body: {},
+      models: ["gemini/nova", "cx/luna"],
+      log,
+      stepCeilingMs: 120,
+      handleSingleModel: async (_b, m) => {
+        vistos.push(m);
+        if (m === "gemini/nova") {
+          await new Promise((r) => setTimeout(r, 3000));
+          pendurouAteOFim = true;
+          return ok();
+        }
+        return ok();
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(vistos).toEqual(["gemini/nova", "cx/luna"]);
+    expect(pendurouAteOFim).toBe(false);
+  });
+
+  it("não corta o ÚLTIMO degrau, nem com teto configurado", async () => {
+    const memoria = _tetoDeDegrauParaTeste();
+    memoria.series.clear();
+
+    // Último degrau: cortar aqui troca uma espera por um erro. Ele espera.
+    const t0 = Date.now();
+    const res = await handleComboChat({
+      body: {},
+      models: ["gemini/unico"],
+      log,
+      stepCeilingMs: 80,
+      handleSingleModel: async () => {
+        await new Promise((r) => setTimeout(r, 300));
+        return ok();
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+  });
+
+  it("o aprendido só ENCURTA: nunca espera mais que o configurado", () => {
+    const memoria = new TetoDeDegrau();
+    // Dupla lenta: sozinho, o aprendido pediria um teto bem acima do configurado.
+    for (let i = 0; i < AMOSTRAS_MINIMAS + 10; i++) memoria.registrarPlena("p", "lento", 90_000);
+
+    const configurado = 25_000;
+    const teto = memoria.tetoPara("p", "lento", configurado);
+    expect(teto).toBeLessThanOrEqual(configurado);
+  });
+
+  it("um degrau rápido não é afetado pelo teto configurado", async () => {
+    const memoria = _tetoDeDegrauParaTeste();
+    memoria.series.clear();
+
+    const res = await handleComboChat({
+      body: {},
+      models: ["gemini/rapido2", "cx/luna"],
+      log,
+      stepCeilingMs: 5000,
+      handleSingleModel: async (_b, m) => {
+        if (m === "gemini/rapido2") return ok();
+        throw new Error("não deveria cair para o segundo degrau");
+      },
+    });
+    expect(res.status).toBe(200);
+  });
+});

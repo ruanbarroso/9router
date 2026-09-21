@@ -28,9 +28,20 @@
 // primeiro: 503 para o usuário depois de um minuto, sem que a alternativa que
 // existia para exatamente este caso tenha sido tocada.
 //
-// A distribuição é BIMODAL, e é isso que torna "aumentar o teto" a resposta
-// errada: não há resposta boa sendo cortada aos 60 s. O ramo rápido responde em
-// 1 s; o ramo patológico não responde nunca. Esperar mais só encarece cada falha.
+// CORREÇÃO (2026-09-21, medido): a distribuição NÃO é bimodal, como esta nota
+// afirmava antes. Medido no HAProxy em 3 h de produção (8.472 requisições, tempo
+// até os headers): p50 9 ms, p90 3,6 s, p99 23,7 s, máx 75 s — uma cauda
+// contínua, não dois ramos. E há sucesso real encostando no teto de quem chama:
+// entre as 159 respostas 200 de `barroso-quick` na mesma janela, a mais lenta
+// levou 59,6 s contra o orçamento de 60 s do barroso-keys.
+//
+// Isso não desfaz o argumento, mas muda o que ele prova. Cortar em T SEMPRE
+// sacrifica algum sucesso legítimo; a questão é se o que se paga na espera vale
+// o que se ganha. É exatamente o que E(T) responde, e é por isso que `C` (o
+// custo da alternativa) é o termo decisivo: com o degrau seguinte respondendo em
+// ~5 s, esperar 60 s por uma cauda de 3,1% deixa de compensar. O que NÃO se pode
+// mais dizer é "não há resposta boa sendo cortada" — há, e os freios abaixo
+// existem para manter esse número pequeno e consciente.
 //
 // ─── A CONTA ─────────────────────────────────────────────────────────────────
 //

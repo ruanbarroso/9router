@@ -6,6 +6,7 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { TetoDeDegrau } from "./stepCeiling.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
+import { COMBO_STEP_CEILING_MS } from "../config/runtimeConfig.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
@@ -340,7 +341,9 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+// `stepCeilingMs` existe para o teste poder exercitar o corte em milissegundos
+// em vez de esperar os 25 s reais. Produção não passa este argumento.
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, stepCeilingMs = COMBO_STEP_CEILING_MS }) {
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -369,7 +372,15 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     // estritamente pior para quem chamou. Ver freio 3 em `stepCeiling.js`.
     const temSaidaDaqui = i + 1 < rotatedModels.length;
     const par = parDoDegrau(modelStr);
-    const tetoMs = temSaidaDaqui && par ? tetoDeDegrau.tetoPara(par.provider, par.model) : null;
+    // O teto CONFIGURADO vale desde a primeira requisição; o aprendido entra
+    // como limite superior e só pode encurtá-lo. Sem esta partida fixa o teto
+    // não existia na prática: `tetoPara` devolve null abaixo de 40 amostras, o
+    // `barroso-quick` recebe ~22 chamadas por hora e a série zera a cada deploy.
+    const tetoMs = temSaidaDaqui
+      ? par
+        ? Math.min(tetoDeDegrau.tetoPara(par.provider, par.model, stepCeilingMs) ?? stepCeilingMs, stepCeilingMs)
+        : stepCeilingMs
+      : null;
     const degrauT0 = Date.now();
 
     try {

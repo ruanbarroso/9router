@@ -58,6 +58,25 @@ export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_M
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
 
+// Teto DE PARTIDA de um degrau de combo que tem para onde cair. Vale desde a
+// primeira requisição, sem esperar medição — o teto aprendido de
+// `services/stepCeiling.js` só pode ENCURTAR daqui para baixo.
+//
+// Por que 25 s e por que precisa existir um valor fixo: quem chama este gateway
+// no caminho do zydon-ai é o barroso-keys, com um orçamento de 60 s. Medido em
+// 3 h de produção (8.472 requisições, tempo até os headers no HAProxy): p50 9 ms,
+// p90 3,6 s, p99 23,7 s, máx 75 s. Um degrau que passa de 25 s já está na cauda
+// do p99, e gastar nela o orçamento inteiro de quem chamou custa o 503 — com o
+// degrau seguinte, que existia exatamente para isto, nunca tentado.
+//
+// O aprendizado sozinho não cobre este caso: ele exige 40 amostras por dupla, o
+// combo `barroso-quick` recebe ~22 chamadas por hora, e a série é em memória e
+// zera a cada deploy. Proteção que só arma depois de uma hora de tráfego não
+// protege a primeira hora — e era nela que os 503 estavam caindo.
+// Env: COMBO_STEP_CEILING_MS. `envMs` só aceita inteiro POSITIVO, então não há
+// como desligar por env — para afrouxar, suba o valor.
+export const COMBO_STEP_CEILING_MS = envMs("COMBO_STEP_CEILING_MS", 25 * 1000);
+
 // Gemini native TTS fetch timeout: abort if Google does not return response headers in time.
 export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS", 45 * 1000);
 
