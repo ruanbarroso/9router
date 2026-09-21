@@ -384,6 +384,12 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   let lastError = null;
   let earliestRetryAfter = null;
   let lastStatus = null;
+  // O custo de abandonar um degrau é uma propriedade DESTA chain: depende de
+  // quem vem depois, não de quem foi abandonado. A chave é a composição da
+  // chain, então mudar os degraus recomeça a medição em vez de herdar a de
+  // outra composição. Ver CUSTO DA ALTERNATIVA MEDIDO em `stepCeiling.js`.
+  const chaveChain = rotatedModels.join(">");
+  let houveCorte = false;
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
@@ -419,7 +425,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     // Quem limita o alongamento é o orçamento, logo abaixo.
     const tetoDeChain = temSaidaDaqui
       ? par
-        ? (tetoDeDegrau.tetoPara(par.provider, par.model) ?? stepCeilingMs)
+        ? (tetoDeDegrau.tetoPara(par.provider, par.model, Infinity, chaveChain) ?? stepCeilingMs)
         : stepCeilingMs
       : null;
     // RATEIO DO ORÇAMENTO (2026-09-21, medido).
@@ -480,6 +486,7 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         // sobrevivência de descartá-la. Ver CENSURA À DIREITA em
         // `stepCeiling.js`.
         if (par) tetoDeDegrau.registrarCortada(par.provider, par.model, Date.now() - degrauT0);
+        houveCorte = true;
         log.warn("COMBO", `Model ${modelStr} excedeu o teto de ${tetoMs}ms, indo para o próximo`);
         lastError = `step ceiling ${tetoMs}ms exceeded`;
         if (!lastStatus) lastStatus = 504;
@@ -500,6 +507,10 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         // observação da distribuição de tempo de entrega por nenhum dos dois
         // lados, então não entra na série de forma alguma.
         if (par) tetoDeDegrau.registrarPlena(par.provider, par.model, Date.now() - degrauT0);
+        // Só interessa o desfecho de quem SOFREU corte: é a pergunta "o que
+        // aconteceu depois de eu ter desistido?". Uma chain que entregou no
+        // primeiro degrau não diz nada sobre o custo de abandonar.
+        if (houveCorte) tetoDeDegrau.registrarDesfecho(chaveChain, true);
         log.info("COMBO", `Model ${modelStr} succeeded`);
         return result;
       }
@@ -560,6 +571,11 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       log.warn("COMBO", `Model ${modelStr} threw error, trying next`, { error: lastError });
     }
   }
+
+  // A chain acabou sem entregar. Se houve corte, este é o desfecho caro que a
+  // constante `CUSTO_ALTERNATIVA_MS` fingia não existir: quem desistiu do
+  // degrau não pagou 5 s de alternativa, pagou a requisição inteira.
+  if (houveCorte) tetoDeDegrau.registrarDesfecho(chaveChain, false);
 
   // All models failed
   // Use 503 (Service Unavailable) rather than 406 (Not Acceptable) — 406 implies

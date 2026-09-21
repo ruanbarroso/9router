@@ -122,6 +122,14 @@ export const AMOSTRA_TTL_MS = 6 * 60 * 60 * 1000;
 // medidas dos degraus que servem de alternativa ficam entre 0 s e 3 s; 5 s é
 // deliberadamente acima delas, porque errar `C` para CIMA só compra paciência.
 export const CUSTO_ALTERNATIVA_MS = 5_000;
+// Custo de a chain INTEIRA não entregar depois do corte. Não é uma latência
+// que alguém espera: é a requisição perdida, o erro que chega a quem chamou.
+// Fixado no orçamento típico do cliente (60 s do barroso-keys), que é o pior
+// que um corte pode causar — ver CUSTO DA ALTERNATIVA MEDIDO.
+export const CUSTO_FALHA_MS = 60_000;
+// Abaixo disto a taxa de entrega da alternativa é ruído e não medição; usa-se
+// o custo otimista de sempre, que é o comportamento anterior a esta mudança.
+export const DESFECHOS_MINIMOS = 10;
 export const PISO_MEDIANA_K = 3;
 // Ver freio 2. Nenhum teto aprendido desce abaixo disto.
 export const TETO_MINIMO_MS = 5_000;
@@ -258,6 +266,47 @@ export function otimoCensurado(obs, custoAlternativaMs = CUSTO_ALTERNATIVA_MS) {
   return { teto: melhorT, naBorda: melhorT === km[km.length - 1].t, S: SAnt };
 }
 
+// ─── CUSTO DA ALTERNATIVA, MEDIDO (2026-09-21) ──────────────────────────────
+//
+// `C` é o termo decisivo de E(T) = E[min(X,T)] + S(T)·C: é ele que decide se
+// vale trocar espera por alternativa. Até aqui ele era a constante
+// `CUSTO_ALTERNATIVA_MS` = 5 s, justificada como "a mediana dos degraus que
+// servem de alternativa". Essa justificativa tem um buraco: ela mede o custo
+// de uma alternativa QUE ENTREGA, e supõe que ela sempre entrega.
+//
+// Medido no `barroso-chat` depois dos deploys de hoje: das requisições que
+// sofreram ao menos um corte, ~33% chegaram a uma entrega. As outras ~67%
+// percorreram o resto da chain e viraram erro para quem chamou.
+//
+// Com C = 5 s a fórmula acredita que desistir custa 5 segundos. Ela custa 5
+// segundos em um terço das vezes e a REQUISIÇÃO INTEIRA nos outros dois
+// terços. Subestimar `C` faz o argmin cortar cedo demais — e foi exatamente o
+// que se observou: entre as entregas reais do `muse-spark`, 16% aconteceram em
+// tempo igual ou superior ao teto aplicado. Um corte em cada seis estava
+// matando uma resposta que vinha.
+//
+//   C = p · CUSTO_ALTERNATIVA_MS + (1 - p) · CUSTO_FALHA_MS
+//
+// onde `p` é a taxa medida de entrega DEPOIS de um corte. Com p = 1 isto
+// devolve a constante antiga, então a mudança só age onde há medição dizendo
+// que a alternativa falha. Com p = 0,33 o custo vai a ~42 s, e esperar passa a
+// valer muito mais do que a conta anterior admitia.
+//
+// Isto não é uma folga arbitrária: é o mesmo argmin de sempre, com o custo
+// deixando de ser um chute otimista e passando a ser medido, como já é o caso
+// da distribuição de X. O freio continua existindo — se a alternativa VOLTAR a
+// entregar, `p` sobe e o teto volta a apertar sozinho.
+
+/**
+ * Custo esperado de abandonar o degrau, dada a taxa de entrega da alternativa.
+ * @param {number|null} taxaEntrega `p` em [0,1], ou null quando não há medição.
+ */
+export function custoDeAbandonar(taxaEntrega) {
+  if (taxaEntrega === null || !Number.isFinite(taxaEntrega)) return CUSTO_ALTERNATIVA_MS;
+  const p = Math.min(1, Math.max(0, taxaEntrega));
+  return p * CUSTO_ALTERNATIVA_MS + (1 - p) * CUSTO_FALHA_MS;
+}
+
 /**
  * Memória por (provider, model) das durações de degrau, plenas e censuradas.
  */
@@ -267,6 +316,39 @@ export class TetoDeDegrau {
     this.ttlMs = ttlMs;
     this.tetoMinimoMs = tetoMinimoMs;
     this.series = new Map();
+    // Desfechos por chain APÓS um corte: {ts, entregou}. É daqui que sai o `p`
+    // de `custoDeAbandonar` — o custo de desistir é uma propriedade da chain,
+    // não do degrau que se abandonou.
+    this.desfechos = new Map();
+  }
+
+  /**
+   * Registra o desfecho de uma chain que sofreu ao menos um corte: a
+   * alternativa entregou, ou a requisição inteira virou erro.
+   */
+  registrarDesfecho(chaveChain, entregou) {
+    if (!chaveChain) return;
+    let serie = this.desfechos.get(chaveChain);
+    if (!serie) {
+      serie = [];
+      this.desfechos.set(chaveChain, serie);
+    }
+    serie.push({ ts: this.agora(), entregou: !!entregou });
+    if (serie.length > AMOSTRAS_MAX) serie.splice(0, serie.length - AMOSTRAS_MAX);
+  }
+
+  /**
+   * Taxa medida de entrega depois de um corte, ou null sem desfechos bastantes
+   * — e aí `custoDeAbandonar` cai no custo otimista de antes.
+   */
+  taxaDeEntregaAposCorte(chaveChain) {
+    const serie = this.desfechos.get(chaveChain);
+    if (!serie) return null;
+    const corte = this.agora() - this.ttlMs;
+    const vivos = serie.filter((d) => d.ts >= corte);
+    if (vivos.length !== serie.length) this.desfechos.set(chaveChain, vivos);
+    if (vivos.length < DESFECHOS_MINIMOS) return null;
+    return vivos.filter((d) => d.entregou).length / vivos.length;
   }
 
   #registrar(provider, model, duracaoMs, cortada) {
@@ -319,7 +401,7 @@ export class TetoDeDegrau {
    * ALONGAR, abaixo. Ele é o que vale na AUSÊNCIA de medição, e quem existe
    * para limitar a espera de quem chamou é o orçamento, no chamador.
    */
-  tetoPara(provider, model, tetoConfiguradoMs = Infinity) {
+  tetoPara(provider, model, tetoConfiguradoMs = Infinity, chaveChain = null) {
     const obs = this.observacoesVivas(provider, model);
     // A censura conta para o mínimo: um degrau que estourou 30 vezes é 30
     // observações do comportamento dele, não zero. Exigir 40 PLENAS de um
@@ -327,7 +409,10 @@ export class TetoDeDegrau {
     // justamente sobre quem mais precisa de teto.
     if (obs.length < AMOSTRAS_MINIMAS) return null;
 
-    const otimo = otimoCensurado(obs);
+    // O custo de desistir é medido, não suposto: ver CUSTO DA ALTERNATIVA
+    // MEDIDO. Sem desfechos bastantes ele é o otimista de sempre.
+    const custo = custoDeAbandonar(this.taxaDeEntregaAposCorte(chaveChain));
+    const otimo = otimoCensurado(obs, custo);
     if (!otimo) return null;
     const { teto, naBorda } = otimo;
 

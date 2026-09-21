@@ -392,6 +392,70 @@ describe("o que entra na série", () => {
   });
 });
 
+// O custo de desistir não é uma latência: em ~2 de cada 3 vezes medidas, a
+// chain que sofreu corte NÃO entregou e virou erro. Tratar isso como "5 s até a
+// alternativa responder" faz o argmin cortar cedo demais — medido em produção,
+// 16% das entregas reais do `muse-spark` aconteceram em tempo igual ou acima do
+// teto aplicado.
+describe("custo de abandonar medido", () => {
+  it("sem desfechos bastantes usa o custo otimista de antes", async () => {
+    const { custoDeAbandonar, CUSTO_ALTERNATIVA_MS } = await import("open-sse/services/stepCeiling.js");
+    expect(custoDeAbandonar(null)).toBe(CUSTO_ALTERNATIVA_MS);
+  });
+
+  it("alternativa que sempre entrega devolve exatamente o custo de antes", async () => {
+    const { custoDeAbandonar, CUSTO_ALTERNATIVA_MS } = await import("open-sse/services/stepCeiling.js");
+    // p = 1 tem de ser idêntico ao comportamento anterior: a mudança só age
+    // onde a medição diz que a alternativa falha.
+    expect(custoDeAbandonar(1)).toBe(CUSTO_ALTERNATIVA_MS);
+  });
+
+  it("alternativa que falha na maioria encarece desistir", async () => {
+    const { custoDeAbandonar, CUSTO_ALTERNATIVA_MS } = await import("open-sse/services/stepCeiling.js");
+    // A taxa medida no `barroso-chat`: 33% de entrega depois de um corte.
+    expect(custoDeAbandonar(0.33)).toBeGreaterThan(CUSTO_ALTERNATIVA_MS * 5);
+  });
+
+  it("a taxa só conta com desfechos suficientes", async () => {
+    const { TetoDeDegrau, DESFECHOS_MINIMOS } = await import("open-sse/services/stepCeiling.js");
+    const t = new TetoDeDegrau();
+    for (let i = 0; i < DESFECHOS_MINIMOS - 1; i++) t.registrarDesfecho("a>b", false);
+    expect(t.taxaDeEntregaAposCorte("a>b")).toBeNull();
+    t.registrarDesfecho("a>b", false);
+    expect(t.taxaDeEntregaAposCorte("a>b")).toBe(0);
+  });
+
+  it("o teto ALONGA quando a alternativa se mostra ruim — o defeito corrigido", async () => {
+    const { TetoDeDegrau, DESFECHOS_MINIMOS } = await import("open-sse/services/stepCeiling.js");
+    // Mesma distribuição de entrega nos dois: cauda longa e censura, o retrato
+    // do `muse-spark`.
+    // Maioria rápida e uma cauda real que vai longe: é aqui que o `C` decide,
+    // porque o argmin fica DENTRO do observado em vez de na borda.
+    const semiar = () => {
+      const t = new TetoDeDegrau();
+      for (let i = 0; i < 40; i++) t.registrarPlena("oc", "muse", 3000 + i * 50);
+      for (let i = 0; i < 15; i++) t.registrarPlena("oc", "muse", 20000 + i * 2000);
+      for (let i = 0; i < 20; i++) t.registrarCortada("oc", "muse", 14000);
+      return t;
+    };
+
+    const alternativaBoa = semiar();
+    for (let i = 0; i < DESFECHOS_MINIMOS; i++) alternativaBoa.registrarDesfecho("c1", true);
+
+    const alternativaRuim = semiar();
+    // 1 em 3 entrega: a medição real.
+    for (let i = 0; i < DESFECHOS_MINIMOS * 3; i++) {
+      alternativaRuim.registrarDesfecho("c2", i % 3 === 0);
+    }
+
+    const tetoBom = alternativaBoa.tetoPara("oc", "muse", Infinity, "c1");
+    const tetoRuim = alternativaRuim.tetoPara("oc", "muse", Infinity, "c2");
+
+    // Quando cair fora quase sempre dá em erro, esperar passa a valer mais.
+    expect(tetoRuim).toBeGreaterThan(tetoBom);
+  });
+});
+
 describe("kaplanMeier", () => {
   it("sem censura reproduz a empírica", async () => {
     const { kaplanMeier } = await import("open-sse/services/stepCeiling.js");
