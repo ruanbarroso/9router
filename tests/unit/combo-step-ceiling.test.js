@@ -62,13 +62,38 @@ describe("TetoDeDegrau", () => {
     // Mediana de 30 s: um modelo legitimamente lento (glm-5.3 tem mediana de 16 s).
     for (let i = 0; i < 100; i++) t.registrarPlena("nvidia", "glm", 28000 + Math.random() * 4000);
     const teto = t.tetoPara("nvidia", "glm");
-    expect(teto).toBeGreaterThan(30000 * PISO_MEDIANA_K * 0.9);
+    // O que importa é que ele CONTINUA SENDO ATENDIDO: o teto cobre a
+    // distribuição inteira dele, em vez de cortá-lo na mediana e apagá-lo.
+    // (Antes isto exigia 3 × mediana = 81 s para amostras que nunca passam de
+    // 32 s — um valor que a série não sustenta. O múltiplo é piso protetor,
+    // não valor final: ver o limite pela cauda observada em `tetoPara`.)
+    expect(teto).toBeGreaterThanOrEqual(32000);
   });
 
-  it("aprender só encurta: nunca ultrapassa o teto configurado", () => {
+  it("aprender pode ALONGAR: medição vale mais que o palpite configurado", () => {
+    // Antes isto exigia `<= configurado` — "aprender só encurta". A regra
+    // parecia conservadora e não era: um degrau que ENTREGA em 50 s era
+    // cortado em 30 s para sempre, e cada corte virava outra censura em 30 s
+    // que confirmava o corte. O teto parava de medir o modelo e passava a
+    // medir a si mesmo.
     const t = new TetoDeDegrau();
     for (let i = 0; i < 100; i++) t.registrarPlena("nvidia", "glm", 50000);
-    expect(t.tetoPara("nvidia", "glm", 30000)).toBeLessThanOrEqual(30000);
+    const teto = t.tetoPara("nvidia", "glm", 30000);
+    // Onde há medição, ela manda — inclusive para cima.
+    expect(teto).toBeGreaterThan(30000);
+    // Mas nunca além da cauda observada: depois do máximo já visto não há
+    // massa de probabilidade que a série conheça.
+    expect(teto).toBeLessThanOrEqual(Math.round(50000 * 1.15));
+  });
+
+  it("quem limita o alongamento é o orçamento, não o teto configurado", () => {
+    // O chamador faz `min(teto, fatia, sobra)`: o prazo do cliente é um fato,
+    // o teto configurado era só um chute sobre o modelo.
+    const t = new TetoDeDegrau();
+    for (let i = 0; i < 100; i++) t.registrarPlena("nvidia", "glm", 50000);
+    const aprendido = t.tetoPara("nvidia", "glm");
+    const sobra = 20000;
+    expect(Math.min(aprendido, sobra)).toBe(20000);
   });
 
   it("esquece amostra velha e volta a não opinar", () => {
@@ -228,14 +253,25 @@ describe("teto configurado (COMBO_STEP_CEILING_MS)", () => {
     expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
   });
 
-  it("o aprendido só ENCURTA: nunca espera mais que o configurado", () => {
+  it("o aprendido ALONGA quando a medição mostra que o degrau entrega além do configurado", () => {
+    // Esta dupla ENTREGA em 90 s, consistentemente. Cortá-la em 25 s porque o
+    // configurado diz 25 s é trocar uma resposta certa por um erro certo — e a
+    // cada corte nasce outra censura em 25 s que "confirma" o corte.
+    //
+    // O configurado é o que se faz SEM MEDIÇÃO. Com 30 observações, a medição
+    // é a melhor resposta que existe, para os dois lados.
     const memoria = new TetoDeDegrau();
-    // Dupla lenta: sozinho, o aprendido pediria um teto bem acima do configurado.
     for (let i = 0; i < AMOSTRAS_MINIMAS + 10; i++) memoria.registrarPlena("p", "lento", 90_000);
 
     const configurado = 25_000;
     const teto = memoria.tetoPara("p", "lento", configurado);
-    expect(teto).toBeLessThanOrEqual(configurado);
+    expect(teto).toBeGreaterThan(configurado);
+    // Limitado pela cauda observada, não pelo múltiplo da mediana (que pediria
+    // 270 s para uma série que nunca passou de 90 s).
+    expect(teto).toBeLessThanOrEqual(Math.round(90_000 * 1.15));
+
+    // E quem impede isso de estourar o cliente é o ORÇAMENTO, no chamador.
+    expect(Math.min(teto, 20_000)).toBe(20_000);
   });
 
   it("um degrau rápido não é afetado pelo teto configurado", async () => {
@@ -253,5 +289,88 @@ describe("teto configurado (COMBO_STEP_CEILING_MS)", () => {
       },
     });
     expect(res.status).toBe(200);
+  });
+});
+
+// CENSURA À DIREITA — uma duração cortada pelo teto não é "levou T", é
+// "passou de T". Descartá-la (o que se fazia antes) evita a catraca e cria o
+// viés de sobrevivência: a série passa a descrever só quem respondeu. Medido
+// em produção: das 29 quedas do degrau 1 do `barroso-chat`, 29 foram por teto.
+describe("aprendizado com observações censuradas", () => {
+  it("não trata a cortada como entrega: nada de catraca", () => {
+    // 30 entregas em 10 s e 70 cortes em 12 s. Se a cortada contasse como
+    // duração observada, o teto desceria rumo ao piso a cada rodada.
+    const t = new TetoDeDegrau();
+    for (let i = 0; i < 30; i++) t.registrarPlena("oc", "muse", 10000);
+    for (let i = 0; i < 70; i++) t.registrarCortada("oc", "muse", 12000);
+    const teto = t.tetoPara("oc", "muse");
+    // O teto não pode cair ABAIXO do que se sabe que entrega.
+    expect(teto).toBeGreaterThanOrEqual(10000);
+  });
+
+  it("a cortada CONTA: um degrau que pendura não passa por rápido", () => {
+    // Mesmas 30 entregas rápidas, mas agora com 70 cortes. Uma série que
+    // ignorasse os cortes veria só "30 amostras de 2 s" e concluiria que este
+    // degrau é rápido — enquanto 70% do tráfego real estoura nele.
+    const soPlenas = new TetoDeDegrau();
+    for (let i = 0; i < 30; i++) soPlenas.registrarPlena("oc", "muse", 2000);
+    const comCensura = new TetoDeDegrau();
+    for (let i = 0; i < 30; i++) comCensura.registrarPlena("oc", "muse", 2000);
+    for (let i = 0; i < 70; i++) comCensura.registrarCortada("oc", "muse", 12000);
+
+    // A série com censura sabe que a maioria não entregou; a outra não faz ideia.
+    const km = comCensura.observacoesVivas("oc", "muse");
+    expect(km.filter((o) => o.cortada).length).toBe(70);
+    expect(soPlenas.observacoesVivas("oc", "muse").every((o) => !o.cortada)).toBe(true);
+  });
+
+  it("a censura conta para o mínimo de amostras", () => {
+    // Exigir N PLENAS de um degrau que pendura na maioria das vezes é nunca
+    // aprender justamente sobre quem mais precisa de teto.
+    const t = new TetoDeDegrau();
+    for (let i = 0; i < 5; i++) t.registrarPlena("oc", "muse", 3000);
+    for (let i = 0; i < AMOSTRAS_MINIMAS; i++) t.registrarCortada("oc", "muse", 12000);
+    expect(t.tetoPara("oc", "muse")).not.toBeNull();
+  });
+
+  it("série curta demais continua sem opinar", () => {
+    const t = new TetoDeDegrau();
+    for (let i = 0; i < 3; i++) t.registrarCortada("oc", "muse", 12000);
+    expect(t.tetoPara("oc", "muse")).toBeNull();
+  });
+
+  it("sem nenhuma entrega não há o que estimar", () => {
+    // Só cortes: Kaplan-Meier não tem evento nenhum, S(t) nunca desce.
+    const t = new TetoDeDegrau();
+    for (let i = 0; i < 50; i++) t.registrarCortada("oc", "muse", 12000);
+    expect(t.tetoPara("oc", "muse")).toBeNull();
+  });
+});
+
+describe("kaplanMeier", () => {
+  it("sem censura reproduz a empírica", async () => {
+    const { kaplanMeier } = await import("open-sse/services/stepCeiling.js");
+    const km = kaplanMeier([
+      { ms: 1000, cortada: false },
+      { ms: 2000, cortada: false },
+      { ms: 3000, cortada: false },
+      { ms: 4000, cortada: false },
+    ]);
+    // Quatro eventos, S cai 1 -> .75 -> .5 -> .25 -> 0
+    expect(km.map((d) => d.S)).toEqual([0.75, 0.5, 0.25, 0]);
+  });
+
+  it("a censura retira do conjunto de risco sem contar como evento", async () => {
+    const { kaplanMeier } = await import("open-sse/services/stepCeiling.js");
+    // 1 entrega em 1 s, 1 corte em 2 s, 1 entrega em 3 s.
+    const km = kaplanMeier([
+      { ms: 1000, cortada: false },
+      { ms: 2000, cortada: true },
+      { ms: 3000, cortada: false },
+    ]);
+    // Em 1 s: 1/3 completou -> S = 2/3. Em 3 s resta 1 em risco (o cortado
+    // saiu) e ele completa -> S = 0. O corte não vira "entregou em 2 s".
+    expect(km[0].S).toBeCloseTo(2 / 3, 5);
+    expect(km[km.length - 1].S).toBeCloseTo(0, 5);
   });
 });

@@ -408,13 +408,18 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     // estritamente pior para quem chamou. Ver freio 3 em `stepCeiling.js`.
     const temSaidaDaqui = i + 1 < rotatedModels.length;
     const par = parDoDegrau(modelStr);
-    // O teto CONFIGURADO vale desde a primeira requisição; o aprendido entra
-    // como limite superior e só pode encurtá-lo. Sem esta partida fixa o teto
-    // não existia na prática: `tetoPara` devolve null abaixo de 40 amostras, o
-    // `barroso-quick` recebe ~22 chamadas por hora e a série zera a cada deploy.
+    // O teto CONFIGURADO vale desde a primeira requisição. Sem esta partida
+    // fixa o teto não existia na prática: `tetoPara` devolve null abaixo de
+    // `AMOSTRAS_MINIMAS`, o `barroso-quick` recebe ~22 chamadas por hora e a
+    // série zera a cada deploy.
+    // O configurado é o que vale SEM MEDIÇÃO. Onde há amostra suficiente, o
+    // aprendido manda — inclusive para ALONGAR: cortar em 12 s um degrau que a
+    // medição diz entregar em 15 s troca a resposta por um erro e ainda
+    // realimenta o próprio corte (ver "APRENDER TAMBÉM PODE ALONGAR").
+    // Quem limita o alongamento é o orçamento, logo abaixo.
     const tetoDeChain = temSaidaDaqui
       ? par
-        ? Math.min(tetoDeDegrau.tetoPara(par.provider, par.model, stepCeilingMs) ?? stepCeilingMs, stepCeilingMs)
+        ? (tetoDeDegrau.tetoPara(par.provider, par.model) ?? stepCeilingMs)
         : stepCeilingMs
       : null;
     // RATEIO DO ORÇAMENTO (2026-09-21, medido).
@@ -468,9 +473,13 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         : await handleSingleModel(body, modelStr);
 
       if (result === CORTADO) {
-        // Amostra NÃO plena: um degrau que o próprio teto cortou não volta para
-        // a série, senão o teto aprende com o que ele mesmo truncou. Ver o bloco
-        // AMOSTRA em `stepCeiling.js`.
+        // Observação CENSURADA: não é uma duração ("levou 12 s"), é um limite
+        // inferior ("passou de 12 s"). Entra na série marcada como tal e o
+        // Kaplan-Meier a usa sem tratá-la como se fosse uma entrega — o que
+        // evita a catraca do bloco AMOSTRA e, ao mesmo tempo, impede o viés de
+        // sobrevivência de descartá-la. Ver CENSURA À DIREITA em
+        // `stepCeiling.js`.
+        if (par) tetoDeDegrau.registrarCortada(par.provider, par.model, Date.now() - degrauT0);
         log.warn("COMBO", `Model ${modelStr} excedeu o teto de ${tetoMs}ms, indo para o próximo`);
         lastError = `step ceiling ${tetoMs}ms exceeded`;
         if (!lastStatus) lastStatus = 504;
