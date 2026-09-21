@@ -1,10 +1,19 @@
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
 
-const DEFAULT_MAX_RECORDS = 200;
+// The Details tab is a troubleshooting log: it has to still hold the request
+// someone is asking about by the time they come looking. At a busy gateway's
+// ~50 req/min the old 200-record cap was ~4 minutes of history, which made the
+// tab useless for anything but the request you just made. 20k is ~7h at that
+// rate and ~days on a quiet instance. Disk stays bounded because the four
+// payload fields are each capped at maxJsonSize, which is halved below to pay
+// for the extra rows: worst case per row goes 4x5KB -> 4x2.5KB, so 20k rows
+// bound at ~200MB instead of the ~400MB the same count would have cost.
+const DEFAULT_MAX_RECORDS = 20000;
 const DEFAULT_BATCH_SIZE = 20;
 const DEFAULT_FLUSH_INTERVAL_MS = 5000;
-const DEFAULT_MAX_JSON_SIZE = 5 * 1024;
+const DEFAULT_MAX_JSON_SIZE_KB = 2.5;
+const DEFAULT_MAX_JSON_SIZE = DEFAULT_MAX_JSON_SIZE_KB * 1024;
 const CONFIG_CACHE_TTL_MS = 5000;
 
 let cachedConfig = null;
@@ -23,7 +32,7 @@ async function getObservabilityConfig() {
         maxRecords: settings.observabilityMaxRecords || parseInt(process.env.OBSERVABILITY_MAX_RECORDS || String(DEFAULT_MAX_RECORDS), 10),
         batchSize: settings.observabilityBatchSize || parseInt(process.env.OBSERVABILITY_BATCH_SIZE || String(DEFAULT_BATCH_SIZE), 10),
         flushIntervalMs: settings.observabilityFlushIntervalMs || parseInt(process.env.OBSERVABILITY_FLUSH_INTERVAL_MS || String(DEFAULT_FLUSH_INTERVAL_MS), 10),
-        maxJsonSize: (settings.observabilityMaxJsonSize || parseInt(process.env.OBSERVABILITY_MAX_JSON_SIZE || "5", 10)) * 1024,
+        maxJsonSize: (settings.observabilityMaxJsonSize || parseFloat(process.env.OBSERVABILITY_MAX_JSON_SIZE) || DEFAULT_MAX_JSON_SIZE_KB) * 1024,
       };
       cachedConfigTs = Date.now();
       return cachedConfig;
@@ -39,7 +48,7 @@ async function getObservabilityConfig() {
       maxRecords: settings.observabilityMaxRecords || parseInt(process.env.OBSERVABILITY_MAX_RECORDS || String(DEFAULT_MAX_RECORDS), 10),
       batchSize: settings.observabilityBatchSize || parseInt(process.env.OBSERVABILITY_BATCH_SIZE || String(DEFAULT_BATCH_SIZE), 10),
       flushIntervalMs: settings.observabilityFlushIntervalMs || parseInt(process.env.OBSERVABILITY_FLUSH_INTERVAL_MS || String(DEFAULT_FLUSH_INTERVAL_MS), 10),
-      maxJsonSize: (settings.observabilityMaxJsonSize || parseInt(process.env.OBSERVABILITY_MAX_JSON_SIZE || "5", 10)) * 1024,
+      maxJsonSize: (settings.observabilityMaxJsonSize || parseFloat(process.env.OBSERVABILITY_MAX_JSON_SIZE) || DEFAULT_MAX_JSON_SIZE_KB) * 1024,
     };
   } catch {
     cachedConfig = {
@@ -109,6 +118,14 @@ async function flushToDatabase() {
             connectionId: item.connectionId || null,
             timestamp: item.timestamp,
             status: item.status || null,
+            // Attribution fields. The dashboard resolves apiKey -> apiKeys.name and
+            // connectionId -> providerConnections.name at read time, so only the raw
+            // identifiers are stored here. Without these a failed request cannot be
+            // traced back to the virtual key or upstream account that produced it.
+            apiKey: item.apiKey || null,
+            endpoint: item.endpoint || null,
+            statusCode: item.statusCode ?? null,
+            errorReason: item.errorReason || null,
             latency: item.latency || {},
             tokens: item.tokens || {},
             request: truncateField(item.request, config.maxJsonSize),

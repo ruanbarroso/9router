@@ -99,6 +99,40 @@ function getInputTokens(tokens) {
   return prompt < cache ? cache : prompt;
 }
 
+// A single request usually costs fractions of a cent, so pricing.formatCost's
+// two decimals would render every row as "$0.00". Scale the precision to the
+// magnitude instead, and keep a true zero visually distinct from "too small to
+// show" so a free/unpriced model doesn't look like a rounding artifact.
+function formatRequestCost(cost) {
+  if (cost === null || cost === undefined || Number.isNaN(cost)) return "—";
+  if (cost === 0) return "$0";
+  if (cost < 0.0001) return "<$0.0001";
+  if (cost < 1) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
+// Rows older than the attribution change carry no statusCode, so fall back to
+// the coarse success/error flag rather than rendering an empty cell.
+function renderStatus(detail) {
+  const isError = detail.status === "error";
+  const code = detail.statusCode;
+  const label = code ? String(code) : isError ? "error" : "ok";
+  const tone = isError
+    ? "text-red-500 dark:text-red-400"
+    : "text-emerald-600 dark:text-emerald-400";
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className={`font-mono ${tone}`}>{label}</span>
+      {detail.errorReason ? (
+        <span className="truncate text-xs text-text-muted" title={detail.errorReason}>
+          {detail.errorReason}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 export default function RequestDetailsTab() {
   const [details, setDetails] = useState([]);
   const [pagination, setPagination] = useState({
@@ -253,12 +287,17 @@ export default function RequestDetailsTab() {
             <thead>
               <tr className="border-b border-black/5 dark:border-white/5">
                 <th className="text-left p-4 text-sm font-semibold text-text-main">Timestamp</th>
+                <th className="text-left p-4 text-sm font-semibold text-text-main">Key</th>
                 <th className="text-left p-4 text-sm font-semibold text-text-main">Model</th>
+                <th className="text-left p-4 text-sm font-semibold text-text-main">Endpoint</th>
                 <th className="text-left p-4 text-sm font-semibold text-text-main">Provider</th>
+                <th className="text-left p-4 text-sm font-semibold text-text-main">Account</th>
+                <th className="text-left p-4 text-sm font-semibold text-text-main">Status</th>
                 <th className="text-right p-4 text-sm font-semibold text-text-main">Input Tokens</th>
                 <th className="text-right p-4 text-sm font-semibold text-text-main">Cached</th>
                 <th className="text-right p-4 text-sm font-semibold text-text-main">Cache Creation</th>
                 <th className="text-right p-4 text-sm font-semibold text-text-main">Output Tokens</th>
+                <th className="text-right p-4 text-sm font-semibold text-text-main">Cost</th>
                 <th className="text-left p-4 text-sm font-semibold text-text-main">Latency</th>
                 <th className="text-center p-4 text-sm font-semibold text-text-main">Action</th>
               </tr>
@@ -266,7 +305,7 @@ export default function RequestDetailsTab() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan="7" className="p-8 text-center text-text-muted">
+                  <td colSpan="14" className="p-8 text-center text-text-muted">
                     <div className="flex items-center justify-center gap-2">
                       <span className="material-symbols-outlined animate-spin text-[20px]">progress_activity</span>
                       Loading...
@@ -275,7 +314,7 @@ export default function RequestDetailsTab() {
                 </tr>
               ) : details.length === 0 ? (
                 <tr>
-                  <td colSpan="7" className="p-8 text-center text-text-muted">
+                  <td colSpan="14" className="p-8 text-center text-text-muted">
                     No request details found
                   </td>
                 </tr>
@@ -288,14 +327,26 @@ export default function RequestDetailsTab() {
                     <td className="whitespace-nowrap p-4 text-sm text-text-main">
                       {new Date(detail.timestamp).toLocaleString()}
                     </td>
+                    <td className="max-w-[160px] truncate p-4 text-sm text-text-main">
+                      {detail.apiKeyName || "—"}
+                    </td>
                     <td className="max-w-[260px] truncate p-4 font-mono text-sm text-text-main">
                       {detail.model}
+                    </td>
+                    <td className="max-w-[180px] truncate p-4 font-mono text-sm text-text-muted">
+                      {detail.endpoint || "—"}
                     </td>
                     <td className="max-w-[180px] truncate p-4 text-sm text-text-main">
                        <span className="font-medium">
                          {getProviderName(detail.provider, providerNameCache)}
                        </span>
                      </td>
+                    <td className="max-w-[220px] truncate p-4 text-sm text-text-muted">
+                      {detail.accountName || "—"}
+                    </td>
+                    <td className="max-w-[240px] p-4 text-sm">
+                      {renderStatus(detail)}
+                    </td>
                     <td className="p-4 text-sm text-text-main text-right font-mono">
                       {getInputTokens(detail.tokens).toLocaleString()}
                     </td>
@@ -307,6 +358,9 @@ export default function RequestDetailsTab() {
                     </td>
                     <td className="p-4 text-sm text-text-main text-right font-mono">
                       {detail.tokens?.completion_tokens?.toLocaleString() || 0}
+                    </td>
+                    <td className="p-4 text-sm text-text-main text-right font-mono">
+                      {formatRequestCost(detail.cost)}
                     </td>
                     <td className="p-4 text-sm text-text-muted">
                       <div className="flex flex-col gap-0.5">
@@ -369,14 +423,37 @@ export default function RequestDetailsTab() {
                 <span className="text-text-main font-mono">{selectedDetail.model}</span>
               </div>
               <div>
+                <span className="text-text-muted">Key:</span>{" "}
+                <span className="text-text-main">{selectedDetail.apiKeyName || "—"}</span>
+              </div>
+              <div>
+                <span className="text-text-muted">Account:</span>{" "}
+                <span className="break-all text-text-main">{selectedDetail.accountName || "—"}</span>
+              </div>
+              <div>
+                <span className="text-text-muted">Endpoint:</span>{" "}
+                <span className="font-mono text-text-main">{selectedDetail.endpoint || "—"}</span>
+              </div>
+              <div>
+                <span className="text-text-muted">Cost:</span>{" "}
+                <span className="font-mono text-text-main">{formatRequestCost(selectedDetail.cost)}</span>
+              </div>
+              <div>
                 <span className="text-text-muted">Status:</span>{" "}
                 <span className={cn(
                   "font-medium",
                   selectedDetail.status === "success" ? "text-green-600" : "text-red-600"
                 )}>
                   {selectedDetail.status}
+                  {selectedDetail.statusCode ? ` (${selectedDetail.statusCode})` : ""}
                 </span>
               </div>
+              {selectedDetail.errorReason ? (
+                <div className="sm:col-span-2">
+                  <span className="text-text-muted">Error:</span>{" "}
+                  <span className="break-words text-red-600 dark:text-red-400">{selectedDetail.errorReason}</span>
+                </div>
+              ) : null}
               <div>
                 <span className="text-text-muted">Latency:</span>{" "}
                 <span className="text-text-main font-mono">

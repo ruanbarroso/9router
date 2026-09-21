@@ -392,12 +392,17 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     trackPendingRequest(model, provider, connectionId, false, true);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
-      provider, model, connectionId,
+      provider, model, connectionId, apiKey,
+      endpoint: clientRawRequest?.endpoint,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
       tokens: { prompt_tokens: 0, completion_tokens: 0 },
       request: extractRequestConfig(body, stream),
       providerRequest: translatedBody || null,
       response: { error: error.message || String(error), status: error.name === "AbortError" ? 499 : 502, thinking: null },
+      // Surfaced as columns so the dashboard can show why a request failed
+      // without reading the request/response payloads, which the API redacts.
+      statusCode: error.name === "AbortError" ? 499 : 502,
+      errorReason: error.message || String(error),
       pxpipe: pxpipeSummary,
       status: "error"
     })).catch(() => { });
@@ -466,12 +471,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     const { statusCode, message, resetsAtMs } = await parseUpstreamError(providerResponse, executor);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${statusCode}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
-      provider, model, connectionId,
+      provider, model, connectionId, apiKey,
+      endpoint: clientRawRequest?.endpoint,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
       tokens: { prompt_tokens: 0, completion_tokens: 0 },
       request: extractRequestConfig(body, stream),
       providerRequest: finalBody || translatedBody || null,
       response: { error: message, status: statusCode, thinking: null },
+      statusCode,
+      errorReason: message,
       pxpipe: pxpipeSummary,
       status: "error"
     })).catch(() => { });
