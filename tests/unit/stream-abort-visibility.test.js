@@ -20,6 +20,16 @@ const { handleStreamingResponse, buildOnStreamComplete } = await import(
 );
 const { buildStreamErrorBytes } = await import("../../open-sse/utils/streamHelpers.js");
 const { checkFallbackError } = await import("../../open-sse/services/accountFallback.js");
+const {
+  _resetPrimeiroByte, registrarPrimeiroByte, tetoDePrimeiroByteMs,
+} = await import("../../open-sse/services/firstByteCeiling.js");
+const { AMOSTRAS_MINIMAS } = await import("../../open-sse/services/stepCeiling.js");
+
+// O portão só arma com medição. Estes testes precisam dele ARMADO, então
+// alimentam a série com TTFTs rápidos — que é o que o tráfego real faria.
+function ensinarTtftRapido(provider = "claude", model = "claude-opus-5") {
+  for (let i = 0; i < AMOSTRAS_MINIMAS + 5; i++) registrarPrimeiroByte(provider, model, 300 + (i % 7) * 20);
+}
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
 
 const enc = new TextEncoder();
@@ -83,10 +93,11 @@ async function drain(stream) {
   return out;
 }
 
-beforeEach(() => { saved.length = 0; });
+beforeEach(() => { saved.length = 0; _resetPrimeiroByte(); });
 
 describe("first-byte gate (claude passthrough only)", () => {
   it("turns an upstream that closes before the first token into a retryable failure", async () => {
+    ensinarTtftRapido();
     const result = await handleStreamingResponse(baseArgs({
       providerResponse: upstream({ start(c) { c.close(); } }),
     }));
@@ -107,12 +118,14 @@ describe("first-byte gate (claude passthrough only)", () => {
   });
 
   it("commits the 200 and loses nothing when a slow upstream exceeds the ceiling", async () => {
-    // Ceiling is 3s; this one answers later, so the gate gives up and the
-    // request proceeds exactly as it did before the gate existed.
+    // O teto aqui é o APRENDIDO com TTFTs de ~300ms (piso de 1s). Este upstream
+    // responde depois disso, então o portão desiste e a requisição segue
+    // exatamente como seguia antes de o portão existir.
+    ensinarTtftRapido();
     const result = await handleStreamingResponse(baseArgs({
       providerResponse: upstream({
         async start(c) {
-          await new Promise((r) => setTimeout(r, 3200));
+          await new Promise((r) => setTimeout(r, 1600));
           c.enqueue(enc.encode('event: message_start\ndata: {"type":"message_start"}\n\n'));
           c.enqueue(enc.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'));
           c.close();
@@ -192,5 +205,50 @@ describe("terminal frame is retryable for Claude clients", () => {
     const out = dec.decode(buildStreamErrorBytes(504, "boom", FORMATS.OPENAI, { sawOpening: false }));
     expect(out).toContain("[DONE]");
     expect(out).not.toContain("message_start");
+  });
+});
+
+// O teto é MEDIDO, não configurado. Estes testes pinam as duas metades disso:
+// sem medição o portão não arma (e não há degrau fixo escondido), e a medição
+// se forma sozinha no tráfego normal — sem isso o portão nunca aprenderia,
+// porque só armaria com amostra e a amostra só viria dele armado.
+describe("teto de primeiro byte é medido, não configurado", () => {
+  it("não arma o portão sem medição suficiente", async () => {
+    // Sem amostra nenhuma: um upstream que fecha sem byte NÃO vira retry, ele
+    // segue o caminho de antes. É a garantia de regressão zero.
+    expect(tetoDePrimeiroByteMs("claude", "claude-opus-5")).toBe(null);
+
+    const result = await handleStreamingResponse(baseArgs({
+      providerResponse: upstream({ start(c) { c.close(); } }),
+    }));
+    expect(result.success).toBe(true);
+  });
+
+  it("aprende o teto com o tráfego normal, sem segurar o 200 (bootstrap)", async () => {
+    // Passa tráfego saudável pelo caminho NÃO gateado e drena — é assim que a
+    // série se forma na produção.
+    for (let i = 0; i < AMOSTRAS_MINIMAS + 2; i++) {
+      const r = await handleStreamingResponse(baseArgs({
+        providerResponse: upstream({
+          start(c) {
+            c.enqueue(enc.encode('event: message_start\ndata: {"type":"message_start"}\n\n'));
+            c.close();
+          },
+        }),
+      }));
+      expect(r.success).toBe(true);
+      await drain(r.response.body);
+    }
+
+    // Agora há medição, e o teto saiu dela.
+    const teto = tetoDePrimeiroByteMs("claude", "claude-opus-5");
+    expect(teto).toBeGreaterThan(0);
+  }, 15000);
+
+  it("mantém séries separadas por dupla provider/model", () => {
+    ensinarTtftRapido("claude", "claude-opus-5");
+    expect(tetoDePrimeiroByteMs("claude", "claude-opus-5")).toBeGreaterThan(0);
+    // Outro modelo não herda a medição do vizinho.
+    expect(tetoDePrimeiroByteMs("claude", "claude-sonnet-5")).toBe(null);
   });
 });

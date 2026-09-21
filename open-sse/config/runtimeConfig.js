@@ -55,26 +55,13 @@ export const STREAM_STALL_TIMEOUT_MS = envMs("STREAM_STALL_TIMEOUT_MS", 360 * 10
 // Time-to-first-token timeout (prompt prefill). Env: STREAM_FIRST_CHUNK_TIMEOUT_MS.
 export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_MS", 200 * 1000);
 
-// Portão de PRIMEIRO BYTE do passthrough Claude: quanto esperar pelo primeiro
-// chunk do upstream ANTES de commitar o 200 para o cliente.
-//
-// O que ele resolve: quando o upstream morre depois dos headers e antes do
-// primeiro token, o gateway já mandou 200 e não tem mais como trocar o status —
-// o Claude Code recebe corpo vazio e reclama de "empty or malformed response
-// (HTTP 200)", e alguém precisa entrar lá e pedir para continuar. Segurando o
-// 200 até o primeiro byte, essa falha vira um `{ success: false }` no laço de
-// contas de `src/sse/handlers/chat.js` e o retry é invisível para o cliente.
-//
-// Por que 3 s e por que só Claude: o TTFT do `claude` tem p99 = 2.824 ms
-// (medido em 2.261 requisições), então 3.000 ms cobre 99,4% do tráfego e só 13
-// requisições esperariam o teto. Um portão global seria outra coisa: o p90
-// global é 18,3 s e o p50 do codex é 26,7 s — a espera cairia dentro da corrida
-// de COMBO_STEP_CEILING_MS (12 s) e comeria o degrau seguinte.
-//
-// Estourar o teto NÃO é erro: o portão desiste e commita o 200 exatamente como
-// antes, então o pior caso é o comportamento de hoje.
-// Env: CLAUDE_FIRST_BYTE_GATE_MS.
-export const CLAUDE_FIRST_BYTE_GATE_MS = envMs("CLAUDE_FIRST_BYTE_GATE_MS", 3000);
+// O teto de PRIMEIRO BYTE do passthrough Claude não é configurado: ele é
+// MEDIDO em `services/firstByteCeiling.js`, com a mesma conta de reinício
+// ótimo e censura à direita do teto de degrau. Havia aqui um
+// `CLAUDE_FIRST_BYTE_GATE_MS = 3000` justificado por um p99 medido uma única
+// vez — o mesmo defeito que `stepCeiling.js` já tinha corrigido: palpite
+// calibrado à mão envelhece sem ninguém perceber. Sem medição suficiente o
+// portão simplesmente não arma.
 
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);

@@ -3,7 +3,8 @@ import { needsTranslation } from "../../translator/index.js";
 import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger } from "../../utils/stream.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS, CLAUDE_FIRST_BYTE_GATE_MS } from "../../config/runtimeConfig.js";
+import { HTTP_STATUS, STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { tetoDePrimeiroByteMs, registrarPrimeiroByte, registrarPrimeiroByteCortado } from "../../services/firstByteCeiling.js";
 import { createErrorResult } from "../../utils/error.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
 import { buildStreamErrorBytes } from "../../utils/streamHelpers.js";
@@ -112,6 +113,27 @@ async function gateOnFirstByte(upstreamBody, ceilingMs) {
 }
 
 /**
+ * Mede o tempo até o primeiro byte SEM impor teto e sem segurar o 200.
+ *
+ * É o bootstrap da série: o portão só arma com medição, e a medição precisa
+ * existir antes dele. Passa os chunks adiante intocados — o único efeito é uma
+ * chamada a `onFirstByte` quando o primeiro chunk não-vazio aparece.
+ */
+function observeFirstByte(upstreamBody, onFirstByte) {
+  const t0 = Date.now();
+  let reported = false;
+  return upstreamBody.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      if (!reported && (chunk?.byteLength || chunk?.length || 0) > 0) {
+        reported = true;
+        try { onFirstByte(Date.now() - t0); } catch { /* medir nunca quebra o stream */ }
+      }
+      controller.enqueue(chunk);
+    }
+  }));
+}
+
+/**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
 export async function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, customToolNames, streamController, onStreamComplete, streamDetailId, settled = { done: false }, pxpipe, reqTag, log, credentials }) {
@@ -155,17 +177,29 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
   // first token is the one failure the gateway can still convert into a retry:
   // no byte has reached the client, so the 200 is not yet committed and
   // `{ success: false }` sends the request back through the account loop in
-  // src/sse/handlers/chat.js. Scope and ceiling are justified in
-  // CLAUDE_FIRST_BYTE_GATE_MS (claude TTFT p99 = 2,824ms); the rest of the
-  // traffic (codex p50 = 26.7s) could never afford the wait.
+  // src/sse/handlers/chat.js.
+  //
+  // O TETO É MEDIDO, NÃO CONFIGURADO. Era uma constante de 3 s justificada por
+  // um p99 que eu medi uma vez; quem dita agora é `firstByteCeiling.js`, com a
+  // mesma conta de reinício ótimo e censura à direita do teto de degrau. Sem
+  // amostra suficiente `tetoDePrimeiroByteMs` devolve null e o portão NÃO ARMA
+  // — o caminho vira exatamente o de antes, sem degrau fixo escondido.
   let upstreamBody = providerResponse.body;
   const isClaudePassthrough =
     sourceFormat === FORMATS.CLAUDE &&
     targetFormat === FORMATS.CLAUDE &&
     PROVIDERS[provider]?.format === FORMATS.CLAUDE;
 
-  if (isClaudePassthrough && upstreamBody) {
-    const gate = await gateOnFirstByte(upstreamBody, CLAUDE_FIRST_BYTE_GATE_MS);
+  const tetoPrimeiroByte = isClaudePassthrough ? tetoDePrimeiroByteMs(provider, model) : null;
+
+  if (isClaudePassthrough && upstreamBody && tetoPrimeiroByte) {
+    const gateT0 = Date.now();
+    const gate = await gateOnFirstByte(upstreamBody, tetoPrimeiroByte);
+    // Alimenta a série que decide o próximo teto. Um upstream que morreu sem
+    // byte NÃO entra: não é um TTFT grande, é uma falha, e registrá-lo
+    // alongaria o teto por causa de quem nunca ia entregar.
+    if (gate.outcome === "byte") registrarPrimeiroByte(provider, model, Date.now() - gateT0);
+    else if (gate.outcome === "timeout") registrarPrimeiroByteCortado(provider, model, Date.now() - gateT0);
     if (gate.outcome === "empty") {
       const msg = `[${provider}/${model}] ${gate.message}`;
       if (log?.errorLine) log.errorLine(reqTag, "⇄", `EMPTY STREAM · ${provider}/${model} · ${Date.now() - requestStartTime}ms → NEXT ACCOUNT`);
@@ -176,6 +210,13 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
       return createErrorResult(HTTP_STATUS.BAD_GATEWAY, msg);
     }
     upstreamBody = gate.body;
+  } else if (isClaudePassthrough && upstreamBody) {
+    // BOOTSTRAP. Sem isto o portão nunca aprenderia: ele só arma com amostra, e
+    // a amostra só existiria se ele armasse. Aqui a medição é passiva — observa
+    // o primeiro byte SEM impor teto nenhum e sem segurar o 200, então a série
+    // se forma no tráfego normal e o portão arma sozinho quando souber o
+    // bastante.
+    upstreamBody = observeFirstByte(upstreamBody, (ms) => registrarPrimeiroByte(provider, model, ms));
   }
 
   // Only now is there evidence of a live stream. Moved off the optimistic path:
