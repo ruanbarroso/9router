@@ -40,10 +40,14 @@ const DEFAULT_SETTINGS = {
   samlAttributeEmail: "email",
   samlAttributeName: "name",
   enableObservability: false,
-  observabilityMaxRecords: 1000,
+  // These defaults, not requestDetailsRepo's, are what actually take effect:
+  // getObservabilityConfig reads `settings.observabilityX || <its own default>`,
+  // and DEFAULT_SETTINGS is always merged in, so the left side is never falsy
+  // and the repo-side default is unreachable. Keep the two in sync.
+  observabilityMaxRecords: 20000,
   observabilityBatchSize: 20,
   observabilityFlushIntervalMs: 5000,
-  observabilityMaxJsonSize: 5,
+  observabilityMaxJsonSize: 2.5,
   outboundProxyEnabled: false,
   outboundProxyUrl: "",
   outboundNoProxy: "",
