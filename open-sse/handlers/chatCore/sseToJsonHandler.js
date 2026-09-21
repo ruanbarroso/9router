@@ -200,6 +200,27 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
   if (isCodexResponsesApi) {
     try {
       const jsonResponse = await convertResponsesStreamToJson(providerResponse.body);
+
+      // 1) Stream cortado E sem nada para entregar é FALHA, não sucesso mudo.
+      // Um 200 com `content: ""` é indistinguível, para o cliente, de um modelo
+      // que escolheu não responder: o combo registra `succeeded`, não desce para
+      // o degrau seguinte, e quem chamou recebe silêncio. Devolver 502 aqui põe
+      // o degrau seguinte em jogo — que é o que a chain existe para fazer.
+      // Só vale quando NÃO há conteúdo: um stream truncado que já entregou texto
+      // ou tool call entrega o que tem, porque descartar isso custaria resposta.
+      const terminou = jsonResponse.status === "completed" || jsonResponse.status === "done";
+      const temAlgoAEntregar = (jsonResponse.output || []).some((item) =>
+        item?.type === "function_call" || item?.type === "custom_tool_call" ||
+        (item?.type === "message" && textFromResponsesMessageItem(item).length > 0));
+      if (!terminou && !temAlgoAEntregar) {
+        log?.line?.(reqTag, "⚠️", `Responses stream encerrou em status=${jsonResponse.status || "desconhecido"} sem conteúdo`);
+        appendLog({ status: "502" });
+        return createErrorResult(
+          HTTP_STATUS.BAD_GATEWAY,
+          `Upstream Responses stream ended without a terminal event (status=${jsonResponse.status || "unknown"}) and delivered no content`
+        );
+      }
+
       if (onRequestSuccess) await onRequestSuccess();
 
       const usage = jsonResponse.usage || {};
@@ -270,7 +291,22 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
         const message = { role: "assistant", content: textContent || (hasToolCalls ? null : "") };
         if (hasToolCalls) message.tool_calls = toolCalls;
         const responseDone = jsonResponse.status === "completed" || jsonResponse.status === "done";
-        const finishReason = hasToolCalls ? "tool_calls" : (responseDone ? "stop" : (jsonResponse.status || "stop"));
+        // `jsonResponse.status` é o status do ENVELOPE da Responses API
+        // (`in_progress`/`completed`/`failed`), NÃO um `finish_reason` de chat.
+        // Vazá-lo para cá produzia `finish_reason: "in_progress"` — valor que não
+        // existe na spec do OpenAI e que todo cliente conservador trata como
+        // falha. Foi o que o gateway `barroso-keys` fez em 2026-09-21: 103 de 478
+        // chamadas do combo `barroso-chat` viraram `502 upstream 200 sem
+        // conteúdo: finish_reason=in_progress`, porque `finishAutorizaVazio` só
+        // aceita o que significa truncagem e qualquer desconhecido cai como
+        // falha — por projeto. O 200 mudo nascia AQUI, não no keys.
+        //
+        // O envelope fica `in_progress` quando o stream do upstream acaba sem
+        // `response.completed`/`response.done`/`response.failed` (ver
+        // `transformer/streamToJsonConverter.js`: `state.status` parte de
+        // `in_progress` e só muda em evento terminal). Ou seja: conexão cortada
+        // no meio. Duas consequências, nesta ordem:
+        const finishReason = hasToolCalls ? "tool_calls" : "stop";
         finalResp = {
           id: jsonResponse.id || `chatcmpl-${Date.now()}`,
           object: "chat.completion",
