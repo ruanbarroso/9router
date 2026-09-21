@@ -77,6 +77,34 @@ export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1
 // como desligar por env — para afrouxar, suba o valor.
 export const COMBO_STEP_CEILING_MS = envMs("COMBO_STEP_CEILING_MS", 25 * 1000);
 
+// ORÇAMENTO TOTAL do combo: o prazo de quem CHAMOU, não o de um degrau.
+//
+// O teto acima corta um degrau pendurado, mas não sabe quanto do prazo do
+// cliente já foi gasto pelos degraus anteriores. Medido em 2026-09-21 numa
+// requisição real de `barroso-chat` que terminou em 503 (`d85a5695`): degrau 1
+// (`muse-spark`) gastou 20,5 s no teto; degrau 2 (`gemini-3.8-flash`) levou 429
+// em 4 contas seguidas até `all 43 accounts locked`, ~6 s, mais 2 s de cooldown;
+// o degrau 3 (`gpt-5.6-luna`, p50 10 s / p90 69 s — o MAIS LENTO da chain)
+// recebeu o bastão com ~30 s já queimados dos 60 s do barroso-keys. O keys
+// desistiu em `upstream nao mandou headers em 60000 ms` enquanto o degrau 3
+// ainda escrevia.
+//
+// Sem deadline o gateway segue abrindo degrau DEPOIS que o cliente foi embora:
+// o trabalho não é só perdido, ele ocupa conta e quota que as requisições ainda
+// vivas precisam — o que realimenta o 429 que derrubou o degrau 2.
+//
+// O prazo chega por header (`X-Deadline-Ms`, quanto o cliente ainda espera);
+// este valor é o piso de segurança de quando NINGUÉM manda header: 0 = sem
+// deadline, comportamento de antes. Deixar desligado por padrão é deliberado —
+// um deadline inventado cortaria cliente sem prazo nenhum.
+// Env: COMBO_TOTAL_BUDGET_MS.
+export const COMBO_TOTAL_BUDGET_MS = envMs("COMBO_TOTAL_BUDGET_MS", 0);
+
+// Margem descontada do deadline do cliente: rede, serialização e o próprio
+// hop do gateway. Responder "não deu" 1,5 s antes do prazo é resposta; 200 ms
+// depois dele é um socket morto.
+export const COMBO_DEADLINE_MARGIN_MS = envMs("COMBO_DEADLINE_MARGIN_MS", 1500);
+
 // Gemini native TTS fetch timeout: abort if Google does not return response headers in time.
 export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS", 45 * 1000);
 

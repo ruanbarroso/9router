@@ -6,7 +6,7 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { TetoDeDegrau } from "./stepCeiling.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
-import { COMBO_STEP_CEILING_MS } from "../config/runtimeConfig.js";
+import { COMBO_STEP_CEILING_MS, COMBO_TOTAL_BUDGET_MS, COMBO_DEADLINE_MARGIN_MS } from "../config/runtimeConfig.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
@@ -330,6 +330,20 @@ export function getComboModelsFromData(modelStr, combosData) {
 }
 
 /**
+ * Quanto tempo o cliente ainda espera, lido do header `X-Deadline-Ms`.
+ * Só um inteiro positivo plausível vale: um valor absurdo (ou negativo, de um
+ * relógio torto na outra ponta) desligaria a chain inteira no primeiro degrau.
+ * Teto de 10 min, bem acima de qualquer cliente real deste gateway.
+ */
+export function deadlineDoHeader(request) {
+  const raw = request?.headers?.get?.("x-deadline-ms");
+  if (!raw) return null;
+  const n = parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(n) || n <= 0 || n > 10 * 60 * 1000) return null;
+  return n;
+}
+
+/**
  * Handle combo chat with fallback
  * @param {Object} options
  * @param {Object} options.body - Request body
@@ -343,7 +357,15 @@ export function getComboModelsFromData(modelStr, combosData) {
  */
 // `stepCeilingMs` existe para o teste poder exercitar o corte em milissegundos
 // em vez de esperar os 25 s reais. Produção não passa este argumento.
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, stepCeilingMs = COMBO_STEP_CEILING_MS }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, stepCeilingMs = COMBO_STEP_CEILING_MS, deadlineMs = null }) {
+  // Quanto tempo o cliente AINDA espera, contado a partir de agora. Vem do
+  // header `X-Deadline-Ms`; `COMBO_TOTAL_BUDGET_MS` é o piso de quando ninguém
+  // manda header (0 = desligado, comportamento de antes).
+  const orcamentoTotal = deadlineMs ?? (COMBO_TOTAL_BUDGET_MS || null);
+  const prazoFinal = orcamentoTotal ? Date.now() + orcamentoTotal - COMBO_DEADLINE_MARGIN_MS : null;
+  const restante = () => (prazoFinal === null ? Infinity : prazoFinal - Date.now());
+  // Piso abaixo do qual abrir um degrau é gasto sem chance de entrega.
+  const MIN_DEGRAU_MS = 2000;
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -365,6 +387,20 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
+
+    // Não abra um degrau para o qual o cliente não tem mais prazo. O trabalho
+    // não seria só perdido: ele ocupa conta e quota que as requisições ainda
+    // vivas precisam — foi assim que o degrau 2 do `barroso-chat` afundou em 429
+    // com 43 contas travadas. O primeiro degrau é exceção: cortar antes de
+    // tentar qualquer coisa troca uma chance por um erro garantido.
+    const sobra = restante();
+    if (i > 0 && sobra < MIN_DEGRAU_MS) {
+      log.warn("COMBO", `Sem orçamento para ${modelStr} (${Math.max(0, sobra)}ms restantes), parando a chain`);
+      lastError = lastError || `combo deadline exceeded with ${Math.max(0, sobra)}ms left`;
+      if (!lastStatus) lastStatus = 504;
+      break;
+    }
+
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     // O teto só vale quando há PARA ONDE cair. Cortar o último degrau não troca
@@ -376,11 +412,18 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
     // como limite superior e só pode encurtá-lo. Sem esta partida fixa o teto
     // não existia na prática: `tetoPara` devolve null abaixo de 40 amostras, o
     // `barroso-quick` recebe ~22 chamadas por hora e a série zera a cada deploy.
-    const tetoMs = temSaidaDaqui
+    const tetoDeChain = temSaidaDaqui
       ? par
         ? Math.min(tetoDeDegrau.tetoPara(par.provider, par.model, stepCeilingMs) ?? stepCeilingMs, stepCeilingMs)
         : stepCeilingMs
       : null;
+    // O orçamento do cliente também é teto — inclusive do ÚLTIMO degrau, que
+    // não tem para onde cair. Ali o corte não troca resposta por erro: passado
+    // o prazo não há mais ninguém escutando, e quem chamou recebe um erro
+    // explicável em vez de um socket que morre em silêncio.
+    const tetoMs = Number.isFinite(sobra)
+      ? Math.max(1, Math.min(tetoDeChain ?? Infinity, sobra))
+      : tetoDeChain;
     const degrauT0 = Date.now();
 
     try {
@@ -442,7 +485,10 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
       // For transient errors (503/502/504), wait for cooldown before falling through
       // so a briefly-overloaded provider gets a chance to recover rather than being
       // skipped immediately (fixes: combo falls through on transient 503)
+      // ...desde que sobre prazo para o degrau seguinte DEPOIS da espera. Dormir
+      // 2 s de um orçamento que já não cobre o próximo degrau só adianta o erro.
       if (cooldownMs && cooldownMs > 0 && cooldownMs <= 5000 &&
+          restante() > cooldownMs + MIN_DEGRAU_MS &&
           (result.status === 503 || result.status === 502 || result.status === 504)) {
         log.info("COMBO", `Model ${modelStr} transient ${result.status}, waiting ${cooldownMs}ms before next`);
         await new Promise(r => setTimeout(r, cooldownMs));
