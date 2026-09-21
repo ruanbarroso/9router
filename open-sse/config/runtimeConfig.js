@@ -62,12 +62,26 @@ export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1
 // primeira requisição, sem esperar medição — o teto aprendido de
 // `services/stepCeiling.js` só pode ENCURTAR daqui para baixo.
 //
-// Por que 25 s e por que precisa existir um valor fixo: quem chama este gateway
-// no caminho do zydon-ai é o barroso-keys, com um orçamento de 60 s. Medido em
-// 3 h de produção (8.472 requisições, tempo até os headers no HAProxy): p50 9 ms,
-// p90 3,6 s, p99 23,7 s, máx 75 s. Um degrau que passa de 25 s já está na cauda
-// do p99, e gastar nela o orçamento inteiro de quem chamou custa o 503 — com o
-// degrau seguinte, que existia exatamente para isto, nunca tentado.
+// Por que precisa existir um valor fixo: quem chama este gateway no caminho do
+// zydon-ai é o barroso-keys, com um orçamento de 60 s. Gastar a cauda inteira
+// num degrau custa o 503 — com o degrau seguinte, que existia exatamente para
+// isto, nunca tentado.
+//
+// Por que 12 s (era 25 s, medido no journal de 2026-09-21, 6h30 de tráfego):
+// o degrau 1 do `barroso-chat` (`muse-spark`) respondeu 1.311 vezes com p50 3 s,
+// p90 11 s, p95 15 s, e estourou o teto 310 vezes — 310 requisições pagando
+// 25 s ANTES de a chain começar. Com o custo real de cair para o resto da chain
+// medido no mesmo journal (degrau 2 p50 9 s, degrau 3 p50 2 s — o degrau 3 é
+// rápido, ao contrário do que o agregado do keys sugeria), minimizar
+// E(T) = E[min(X,T)] + P(X>T)·C dá ótimo raso entre 4 s e 9 s (E≈7,7 s) contra
+// E=10,7 s em 25 s.
+//
+// Não peguei o mínimo da curva: o ganho de 12 s para 5 s é de 0,7 s por
+// requisição, mas leva a queda para o degrau 2 de 25% para 39% do tráfego — e
+// o degrau 2 é justamente o que morreu de quota (`all 43 accounts locked`) no
+// incidente que originou tudo isto. 12 s fica a 0,3 s do ótimo, economiza 2,3 s
+// por requisição e move só +5 pp para o degrau frágil. O p90 do degrau 1 (11 s)
+// cabe embaixo do teto, então quem hoje entrega no degrau 1 continua entregando.
 //
 // O aprendizado sozinho não cobre este caso: ele exige 40 amostras por dupla, o
 // combo `barroso-quick` recebe ~22 chamadas por hora, e a série é em memória e
@@ -75,7 +89,7 @@ export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1
 // protege a primeira hora — e era nela que os 503 estavam caindo.
 // Env: COMBO_STEP_CEILING_MS. `envMs` só aceita inteiro POSITIVO, então não há
 // como desligar por env — para afrouxar, suba o valor.
-export const COMBO_STEP_CEILING_MS = envMs("COMBO_STEP_CEILING_MS", 25 * 1000);
+export const COMBO_STEP_CEILING_MS = envMs("COMBO_STEP_CEILING_MS", 12 * 1000);
 
 // ORÇAMENTO TOTAL do combo: o prazo de quem CHAMOU, não o de um degrau.
 //
