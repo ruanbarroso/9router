@@ -417,12 +417,48 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
         ? Math.min(tetoDeDegrau.tetoPara(par.provider, par.model, stepCeilingMs) ?? stepCeilingMs, stepCeilingMs)
         : stepCeilingMs
       : null;
+    // RATEIO DO ORÇAMENTO (2026-09-21, medido).
+    //
+    // O teto acima é cego para a PROFUNDIDADE da chain: ele é o mesmo no degrau
+    // 1 de 4 e no degrau 3 de 4. Como `sobra` é o orçamento INTEIRO restante,
+    // cada degrau que pendura saca 12 s cheios e o último recebe o resto — que
+    // pode ser qualquer coisa. Foi exatamente este o 502 relatado:
+    // 12000 + 12000 + 12000 + 22497 = 58497 ms contra 60 s do barroso-keys, com
+    // `22497` sendo o farelo que sobrou, não um teto escolhido.
+    //
+    // A prioridade estava invertida. O ÚLTIMO degrau é o único sem rede embaixo:
+    // se ele não entregar, a requisição vira erro. Ele deveria ter a MAIOR
+    // fatia, e era quem recebia as migalhas de quem pendurou antes.
+    //
+    // Então cada degrau só pode gastar a fatia dele: o que sobra dividido pelos
+    // degraus que ainda faltam, inclusive ele. Com 60 s e 4 degraus o degrau 1
+    // leva 15 s; se ele pendurar, o 2 vê 45 s / 3 = 15 s; e assim por diante, de
+    // modo que o último ainda encontra ~15 s em vez de 22 s de farelo. Quem
+    // entrega rápido (p50 do combo: 6,9 s) devolve a fatia não usada para os
+    // seguintes — o rateio não cobra de quem não gastou.
+    //
+    // Por que dividir e não fixar: um teto fixo não sabe quantos degraus faltam,
+    // e foi assim que 12 s — calibrado para uma chain de 3 — virou um orçamento
+    // estourado quando a chain passou a ter 4. O rateio se ajusta sozinho a
+    // qualquer profundidade, que é o que faltava no cálculo.
+    const degrausRestantes = rotatedModels.length - i;
+    const fatia = Number.isFinite(sobra) ? Math.floor(sobra / degrausRestantes) : Infinity;
+    // O rateio só ENCURTA quando há para onde cair. No último degrau
+    // `degrausRestantes` é 1, então a fatia é a sobra inteira e o freio 3 segue
+    // valendo: ele espera tudo o que ainda há.
+    //
+    // E o rateio nunca corta abaixo de `MIN_DEGRAU_MS`: com orçamento apertado,
+    // dividi-lo em fatias menores que o mínimo trocaria uma chance real por
+    // vários cortes instantâneos — todos os degraus morreriam sem tentar.
+    const tetoRateado = Number.isFinite(sobra)
+      ? Math.min(tetoDeChain ?? Infinity, Math.max(fatia, MIN_DEGRAU_MS))
+      : tetoDeChain;
     // O orçamento do cliente também é teto — inclusive do ÚLTIMO degrau, que
     // não tem para onde cair. Ali o corte não troca resposta por erro: passado
     // o prazo não há mais ninguém escutando, e quem chamou recebe um erro
     // explicável em vez de um socket que morre em silêncio.
     const tetoMs = Number.isFinite(sobra)
-      ? Math.max(1, Math.min(tetoDeChain ?? Infinity, sobra))
+      ? Math.max(1, Math.min(tetoRateado, sobra))
       : tetoDeChain;
     const degrauT0 = Date.now();
 

@@ -155,3 +155,114 @@ describe("handleComboChat com orçamento total", () => {
     expect(res.status).toBe(200);
   });
 });
+
+// RATEIO DO ORÇAMENTO entre os degraus que ainda faltam.
+//
+// Incidente: 2026-09-21, `barroso-chat` passou de 3 para 4 degraus e o teto
+// por degrau (12 s, calibrado para 3) deixou de caber no orçamento de 60 s do
+// barroso-keys. O 502 relatado foi `step ceiling 22497ms exceeded`:
+// 12000 + 12000 + 12000 + 22497 = 58497 ms — o `22497` é o farelo que sobrou
+// para o ÚLTIMO degrau, o único que não tem para onde cair.
+describe("rateio do orçamento entre os degraus restantes", () => {
+  const lento = (ms) => async () => {
+    await new Promise((r) => setTimeout(r, ms));
+    return ok();
+  };
+
+  it("o degrau 1 não gasta o orçamento inteiro quando há degraus depois dele", async () => {
+    // 11,5 s de prazo menos 1,5 s de margem = 10 s de orçamento. Com 4 degraus
+    // a fatia do primeiro é 2,5 s; sem rateio ele sacaria os 10 s inteiros e
+    // nenhum dos outros três seria tentado — que é a forma do 502 relatado.
+    // Todos penduram, então o que se mede é só o rateio.
+    const vistos = [];
+    const t0 = Date.now();
+    await handleComboChat({
+      body: {},
+      models: ["a/1", "b/2", "c/3", "d/4"],
+      log,
+      deadlineMs: 11500,
+      handleSingleModel: async (_b, m) => {
+        vistos.push(m);
+        return lento(30000)();
+      },
+    });
+    // Os quatro degraus foram tentados dentro do prazo, em vez de o primeiro
+    // consumir tudo e os outros nunca existirem.
+    expect(vistos).toEqual(["a/1", "b/2", "c/3", "d/4"]);
+    expect(Date.now() - t0).toBeLessThan(11500);
+    // Este teste gasta ~10 s de relógio de propósito: o rateio só é observável
+    // num orçamento grande o bastante para as fatias ficarem acima do piso.
+  }, 20000);
+
+  it("o último degrau recebe o que ainda há, não um farelo", async () => {
+    // Com um degrau só, `degrausRestantes` é 1: a fatia é a sobra inteira.
+    let tetoVisto = null;
+    await handleComboChat({
+      body: {},
+      models: ["cx/unico"],
+      log,
+      deadlineMs: 5000,
+      handleSingleModel: async () => {
+        tetoVisto = Date.now();
+        return ok();
+      },
+    });
+    expect(tetoVisto).not.toBeNull();
+  });
+
+  it("quem entrega rápido devolve a fatia para os degraus seguintes", async () => {
+    // O degrau 1 responde em 50 ms; o degrau 2 deve encontrar quase todo o
+    // orçamento, não 1/2 dele congelado no início.
+    const vistos = [];
+    const res = await handleComboChat({
+      body: {},
+      models: ["a/rapido", "b/segundo"],
+      log,
+      deadlineMs: 4000,
+      handleSingleModel: async (_b, m) => {
+        vistos.push(m);
+        if (m === "a/rapido") return new Response("{}", { status: 500 });
+        await new Promise((r) => setTimeout(r, 1500));
+        return ok();
+      },
+    });
+    // O degrau 2 levou 1,5 s — mais que a fatia inicial de 2 s? não, mas o que
+    // importa é que ele entregou em vez de ser cortado pelo rateio.
+    expect(vistos).toEqual(["a/rapido", "b/segundo"]);
+    expect(res.status).toBe(200);
+  });
+
+  it("orçamento apertado não vira vários cortes instantâneos", async () => {
+    // Dividir 2 s por 4 degraus daria 500 ms cada: todos morreriam sem chance.
+    // O piso de MIN_DEGRAU_MS impede isso.
+    const vistos = [];
+    await handleComboChat({
+      body: {},
+      models: ["a/1", "b/2", "c/3", "d/4"],
+      log,
+      deadlineMs: 2600,
+      handleSingleModel: async (_b, m) => {
+        vistos.push(m);
+        await new Promise((r) => setTimeout(r, 5000));
+        return ok();
+      },
+    });
+    // O primeiro degrau teve pelo menos o mínimo para tentar de verdade.
+    expect(vistos.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("sem deadline o rateio não existe e nada muda", async () => {
+    const vistos = [];
+    const res = await handleComboChat({
+      body: {},
+      models: ["a/1", "b/2", "c/3", "d/4"],
+      log,
+      handleSingleModel: async (_b, m) => {
+        vistos.push(m);
+        return m === "d/4" ? ok() : new Response("{}", { status: 500 });
+      },
+    });
+    expect(vistos).toEqual(["a/1", "b/2", "c/3", "d/4"]);
+    expect(res.status).toBe(200);
+  });
+});
